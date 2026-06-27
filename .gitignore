@@ -1,0 +1,11 @@
+# IDE
+.idea/
+
+# Скачанные видео и логи
+downloads/
+failed.txt
+*.log
+
+# Бинарник
+*.exe
+tiktok-downloader
