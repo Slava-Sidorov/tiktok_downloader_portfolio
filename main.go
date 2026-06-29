@@ -657,7 +657,9 @@ func main() {
 				totalVideos, recommendedWorkers, len(proxies))
 			logToFile("Старт: %d ссылок, %d воркеров, %d прокси", totalVideos, recommendedWorkers, len(proxies))
 
-			// Инициализация progressbar
+			// Инициализация progressbar под printMu: sig-handler читает bar
+			// через safePrint (тот же мьютекс), поэтому запись обязана быть под ним.
+			printMu.Lock()
 			bar = progressbar.NewOptions(totalVideos,
 				progressbar.OptionSetDescription("Загрузка видео"),
 				progressbar.OptionShowCount(),
@@ -669,6 +671,7 @@ func main() {
 					BarEnd:        "]",
 				}),
 			)
+			printMu.Unlock()
 
 			// Канал ссылок
 			urlCh := make(chan string, recommendedWorkers)
