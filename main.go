@@ -41,6 +41,7 @@ var (
 	printMu  sync.Mutex
 
 	blacklist  sync.Map // map[string]struct{} — заблокированные прокси
+	bannedN    int32    // атомарный счётчик забаненных прокси (для раннего выхода в nextProxy)
 	failedMu   sync.Mutex
 	failedURLs []string // ссылки, упавшие после всех попыток
 )
@@ -247,8 +248,11 @@ func extractTikTokID(rawURL string) string {
 // nextProxy возвращает следующий не заблокированный прокси по кругу.
 // Если все прокси в блэклисте — возвращает ("", false).
 func nextProxy(proxies []string, idx *int32) (string, bool) {
+	if int(atomic.LoadInt32(&bannedN)) >= len(proxies) {
+		return "", false // все мертвы — не крутим холостые круги
+	}
 	for range proxies {
-		i := int(atomic.AddInt32(idx, 1)) % len(proxies)
+		i := int(uint32(atomic.AddInt32(idx, 1)) % uint32(len(proxies)))
 		p := proxies[i]
 		if _, banned := blacklist.Load(p); !banned {
 			return p, true
