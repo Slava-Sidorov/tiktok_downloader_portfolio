@@ -37,12 +37,31 @@ var (
 	verboseMode bool
 	fileLogger  *log.Logger
 
-	bar *progressbar.ProgressBar
+	bar      *progressbar.ProgressBar
+	printMu  sync.Mutex
 
-	blacklist  sync.Map // map[string]struct{} — заблокированные прокси
-	failedMu   sync.Mutex
-	failedURLs []string // ссылки, упавшие после всех попыток
+	blacklist sync.Map // map[string]struct{} — заблокированные прокси
+	bannedN   int32    // атомарный счётчик забаненных прокси (для раннего выхода в nextProxy)
+	failCount sync.Map // map[string]*int32 — подряд-фейлы по прокси (мягкий бан)
+
+	failedMu    sync.Mutex
+	failedItems []failedItem // ссылки, упавшие после всех попыток (URL + причина)
 )
+
+// failedItem — упавшая ссылка с причиной для failed_reasons.txt.
+type failedItem struct {
+	url    string
+	reason string
+}
+
+func safePrint(format string, a ...interface{}) {
+	printMu.Lock()
+	defer printMu.Unlock()
+	if bar != nil {
+		bar.Clear()
+	}
+	fmt.Printf(format, a...)
+}
 
 func logToFile(format string, v ...interface{}) {
 	if fileLogger != nil {
@@ -234,11 +253,26 @@ func extractTikTokID(rawURL string) string {
 	return ""
 }
 
+func dedupKey(rawURL string) string {
+	if id := extractTikTokID(rawURL); id != "" {
+		return "id:" + id
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return "url:" + u.String()
+	}
+	return "raw:" + rawURL
+}
+
 // nextProxy возвращает следующий не заблокированный прокси по кругу.
 // Если все прокси в блэклисте — возвращает ("", false).
 func nextProxy(proxies []string, idx *int32) (string, bool) {
+	if int(atomic.LoadInt32(&bannedN)) >= len(proxies) {
+		return "", false // все мертвы — не крутим холостые круги
+	}
 	for range proxies {
-		i := int(atomic.AddInt32(idx, 1)) % len(proxies)
+		i := int(uint32(atomic.AddInt32(idx, 1)) % uint32(len(proxies)))
 		p := proxies[i]
 		if _, banned := blacklist.Load(p); !banned {
 			return p, true
@@ -247,8 +281,83 @@ func nextProxy(proxies []string, idx *int32) (string, bool) {
 	return "", false
 }
 
+type ytdlpErrKind int
+
+const (
+	errVideo ytdlpErrKind = iota // прокси не виноват — видео не оживёт от смены прокси
+	errProxy                     // прокси/сеть — всё, что не video
+)
+
+const failsToBan = 2 // мягкий бан: после стольких подряд-фейлов прокси банится
+
+// videoMarkers — стабильные сообщения экстрактора yt-dlp: видео недоступно
+// независимо от прокси. Стартовый набор по issue yt-dlp; вынесен отдельно,
+// чтобы легко дополнять по реальным логам TikTok-экстрактора.
+var videoMarkers = []struct{ marker, reason string }{
+	{"video unavailable", "видео недоступно"},
+	{"this video is not available", "видео недоступно"},
+	{"this post is not available", "пост недоступен"},
+	{"private", "приватное видео"},
+	{"has been removed", "видео удалено"},
+	{"not available in your country", "geo-блокировка"},
+	{"http error 404", "404 — не найдено"},
+	{"unsupported url", "неподдерживаемый URL"},
+}
+
+// proxyReasons — распознаваемые сетевые/прокси-ошибки для понятного лога.
+// На логику бана не влияют: всё, что не video, и так считается errProxy.
+var proxyReasons = []struct{ marker, reason string }{
+	{"tunnel connection failed: 407", "407 — неверные креды прокси"},
+	{"unable to connect to proxy", "прокси не отвечает"},
+	{"actively refused", "прокси отклонил соединение"},
+	{"connection refused", "соединение отклонено"},
+	{"timed out", "таймаут"},
+	{"max retries exceeded", "превышены ретраи соединения"},
+}
+
+// classifyYtdlpError — стратегия «от обратного»: сначала ищем явные video-маркеры
+// (стабильны), иначе любая ошибка трактуется как errProxy.
+func classifyYtdlpError(stderr string) (ytdlpErrKind, string) {
+	s := strings.ToLower(stderr)
+	for _, v := range videoMarkers {
+		if strings.Contains(s, v.marker) {
+			return errVideo, v.reason
+		}
+	}
+	for _, p := range proxyReasons {
+		if strings.Contains(s, p.marker) {
+			return errProxy, p.reason
+		}
+	}
+	return errProxy, "сетевая ошибка / прокси"
+}
+
+// incFailAndMaybeBan увеличивает счётчик подряд-фейлов прокси и банит его при
+// достижении порога. Бан выполняется РОВНО ОДИН раз через blacklist.LoadOrStore —
+// даже если два воркера одновременно довели счётчик до порога, bannedN
+// инкрементируется только при первом фактическом помещении в блэклист.
+func incFailAndMaybeBan(proxy string) {
+	v, _ := failCount.LoadOrStore(proxy, new(int32))
+	n := atomic.AddInt32(v.(*int32), 1)
+	if n >= failsToBan {
+		if _, already := blacklist.LoadOrStore(proxy, struct{}{}); !already {
+			atomic.AddInt32(&bannedN, 1)
+		}
+		atomic.StoreInt32(v.(*int32), 0) // чистим счётчик после бана
+	}
+}
+
+// resetFail обнуляет счётчик подряд-фейлов: успех «оживляет» прокси, иначе
+// банились бы и живые прокси, у которых фейлы были не подряд.
+func resetFail(proxy string) {
+	if v, ok := failCount.Load(proxy); ok {
+		atomic.StoreInt32(v.(*int32), 0)
+	}
+}
+
 // runYtDlp запускает yt-dlp для одной ссылки через указанный прокси.
-func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) error {
+// Возвращает stderr наверх, чтобы вызывающий мог классифицировать ошибку.
+func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, error) {
 	var stdoutBuf, stderrBuf bytes.Buffer
 
 	cmd := exec.CommandContext(ctx, "yt-dlp",
@@ -273,13 +382,13 @@ func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) error {
 	setSysProcAttr(cmd)
 	err := cmd.Run()
 
+	stderr := stderrBuf.String()
 	if err != nil && verboseMode && len(bytes.TrimSpace(stderrBuf.Bytes())) > 0 {
-		bar.Clear()
-		fmt.Printf("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), stderrBuf.String())
-		logToFile("yt-dlp stderr: %s", stderrBuf.String())
+		safePrint("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), stderr)
+		logToFile("yt-dlp stderr: %s", stderr)
 	}
 
-	return err
+	return stderr, err
 }
 
 func worker(ctx context.Context, id int, urls <-chan string, proxies []string, idx *int32, delay time.Duration, outDir string, archive map[string]bool, wg *sync.WaitGroup) {
@@ -303,44 +412,62 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 
 			start := time.Now()
 			done := false
+			lastReason := "неизвестная причина"
 
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				proxy, ok := nextProxy(proxies, idx)
 				if !ok {
-					bar.Clear()
-					fmt.Printf("[%s] ⛔ W%d | свободных прокси не осталось\n",
+					safePrint("[%s] ⛔ W%d | свободных прокси не осталось\n",
 						time.Now().Format("15:04:05"), id)
 					logToFile("W%d свободных прокси не осталось", id)
+					lastReason = "нет живых прокси"
 					break
 				}
 
-				err := runYtDlp(ctx, proxy, urlLink, outDir)
+				stderr, err := runYtDlp(ctx, proxy, urlLink, outDir)
 				if err == nil {
 					atomic.AddInt64(&downloaded, 1)
+					resetFail(proxy) // прокси жив → обнуляем подряд-фейлы
 					logToFile("✅ W%d | %.1fs | %s", id, time.Since(start).Seconds(), urlLink)
 					done = true
 					break
 				}
 
-				// упавший прокси — в блэклист, следующая попытка с другим
-				blacklist.Store(proxy, struct{}{})
+				kind, reason := classifyYtdlpError(stderr)
+				lastReason = reason
+
+				if kind == errVideo {
+					// видео не оживёт от смены прокси — прокси не виноват, не ретраим
+					break
+				}
+
+				// errProxy — +1 подряд-фейл (бан при failsToBan); причина в консоль и лог
+				incFailAndMaybeBan(proxy)
+				safePrint("[%s] ⚠ W%d | прокси-ошибка (%s), попытка %d/%d\n",
+					time.Now().Format("15:04:05"), id, reason, attempt, maxAttempts)
+				logToFile("⚠ W%d | прокси-ошибка (%s), попытка %d/%d: %s",
+					id, reason, attempt, maxAttempts, urlLink)
 			}
 
 			if !done {
 				atomic.AddInt64(&failed, 1)
-				bar.Clear()
-				fmt.Printf("[%s] ❌ W%d | %.1fs | все попытки исчерпаны: %s\n",
-					time.Now().Format("15:04:05"), id, time.Since(start).Seconds(), urlLink)
-				logToFile("❌ W%d | %.1fs | все попытки: %s", id, time.Since(start).Seconds(), urlLink)
+				safePrint("[%s] ❌ W%d | %.1fs | не скачано (%s): %s\n",
+					time.Now().Format("15:04:05"), id, time.Since(start).Seconds(), lastReason, urlLink)
+				logToFile("❌ W%d | %.1fs | не скачано (%s): %s",
+					id, time.Since(start).Seconds(), lastReason, urlLink)
 				failedMu.Lock()
-				failedURLs = append(failedURLs, urlLink)
+				failedItems = append(failedItems, failedItem{url: urlLink, reason: lastReason})
 				failedMu.Unlock()
 			}
 
 			bar.Add(1)
 
 			if delay > 0 {
-				time.Sleep(delay)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
 			}
 		}
 	}
@@ -416,10 +543,7 @@ func main() {
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 			go func() {
 				<-sigCh
-				if bar != nil {
-					bar.Clear()
-				}
-				fmt.Println("\n⚠️  Получен сигнал завершения, останавливаем загрузки...")
+				safePrint("\n⚠️  Получен сигнал завершения, останавливаем загрузки...\n")
 				cancel()
 			}()
 
@@ -478,6 +602,11 @@ func main() {
 				os.Exit(1)
 			}
 
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				fmt.Printf("❌ Не удалось создать папку для загрузок %q: %v\n", outDir, err)
+				os.Exit(1)
+			}
+
 			// Тест прокси / авто-расчёт воркеров
 			recommendedWorkers := numWorkers
 			if numWorkers == 0 {
@@ -494,8 +623,6 @@ func main() {
 				fmt.Printf("⚙️ Ручной режим: %d воркеров (тест скорости пропущен)\n", numWorkers)
 			}
 
-			os.MkdirAll(outDir, 0755)
-
 			// Загружаем архив уже скачанных видео
 			archive := loadArchive(filepath.Join(outDir, ".archive.txt"))
 
@@ -510,8 +637,12 @@ func main() {
 			sc2 := bufio.NewScanner(uf)
 			for sc2.Scan() {
 				line := strings.TrimSpace(sc2.Text())
-				if line != "" && !seen[line] {
-					seen[line] = true
+				if line == "" {
+					continue
+				}
+				key := dedupKey(line)
+				if !seen[key] {
+					seen[key] = true
 					urlList = append(urlList, line)
 				}
 			}
@@ -526,7 +657,9 @@ func main() {
 				totalVideos, recommendedWorkers, len(proxies))
 			logToFile("Старт: %d ссылок, %d воркеров, %d прокси", totalVideos, recommendedWorkers, len(proxies))
 
-			// Инициализация progressbar
+			// Инициализация progressbar под printMu: sig-handler читает bar
+			// через safePrint (тот же мьютекс), поэтому запись обязана быть под ним.
+			printMu.Lock()
 			bar = progressbar.NewOptions(totalVideos,
 				progressbar.OptionSetDescription("Загрузка видео"),
 				progressbar.OptionShowCount(),
@@ -538,6 +671,7 @@ func main() {
 					BarEnd:        "]",
 				}),
 			)
+			printMu.Unlock()
 
 			// Канал ссылок
 			urlCh := make(chan string, recommendedWorkers)
@@ -572,20 +706,34 @@ func main() {
 				atomic.LoadInt64(&downloaded), atomic.LoadInt64(&skipped), atomic.LoadInt64(&failed))
 
 			failedMu.Lock()
-			fails := failedURLs
+			fails := failedItems
 			failedMu.Unlock()
 			if len(fails) > 0 {
-				path := filepath.Join(outDir, "failed.txt")
-				f, err := os.Create(path)
-				if err != nil {
-					fmt.Printf("⚠️ Не удалось записать failed.txt: %v\n", err)
+				urlPath := filepath.Join(outDir, "failed.txt")
+				reasonPath := filepath.Join(outDir, "failed_reasons.txt")
+
+				// failed.txt — чистый список URL для повторного прогона
+				if uf, err := os.Create(urlPath); err != nil {
+					fmt.Printf("⚠️ Не удалось записать %s: %v\n", urlPath, err)
 				} else {
-					for _, u := range fails {
-						fmt.Fprintln(f, u)
+					for _, it := range fails {
+						fmt.Fprintln(uf, it.url)
 					}
-					f.Close()
-					fmt.Printf("📄 Список упавших ссылок сохранён: %s\n", path)
+					uf.Close()
 				}
+
+				// failed_reasons.txt — URL + причина (tab-separated)
+				if rf, err := os.Create(reasonPath); err != nil {
+					fmt.Printf("⚠️ Не удалось записать %s: %v\n", reasonPath, err)
+				} else {
+					for _, it := range fails {
+						fmt.Fprintf(rf, "%s\t%s\n", it.url, it.reason)
+					}
+					rf.Close()
+				}
+
+				fmt.Printf("📄 Упавшие ссылки: %s (%d) | с причинами: %s\n",
+					urlPath, len(fails), reasonPath)
 			}
 			return nil
 		},
