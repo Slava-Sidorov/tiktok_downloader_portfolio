@@ -253,6 +253,18 @@ func extractTikTokID(rawURL string) string {
 	return ""
 }
 
+func dedupKey(rawURL string) string {
+	if id := extractTikTokID(rawURL); id != "" {
+		return "id:" + id
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		u.RawQuery = ""
+		u.Fragment = ""
+		return "url:" + u.String()
+	}
+	return "raw:" + rawURL
+}
+
 // nextProxy возвращает следующий не заблокированный прокси по кругу.
 // Если все прокси в блэклисте — возвращает ("", false).
 func nextProxy(proxies []string, idx *int32) (string, bool) {
@@ -625,8 +637,12 @@ func main() {
 			sc2 := bufio.NewScanner(uf)
 			for sc2.Scan() {
 				line := strings.TrimSpace(sc2.Text())
-				if line != "" && !seen[line] {
-					seen[line] = true
+				if line == "" {
+					continue
+				}
+				key := dedupKey(line)
+				if !seen[key] {
+					seen[key] = true
 					urlList = append(urlList, line)
 				}
 			}
