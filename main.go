@@ -590,6 +590,11 @@ func main() {
 				os.Exit(1)
 			}
 
+			if err := os.MkdirAll(outDir, 0755); err != nil {
+				fmt.Printf("❌ Не удалось создать папку для загрузок %q: %v\n", outDir, err)
+				os.Exit(1)
+			}
+
 			// Тест прокси / авто-расчёт воркеров
 			recommendedWorkers := numWorkers
 			if numWorkers == 0 {
@@ -605,8 +610,6 @@ func main() {
 			} else {
 				fmt.Printf("⚙️ Ручной режим: %d воркеров (тест скорости пропущен)\n", numWorkers)
 			}
-
-			os.MkdirAll(outDir, 0755)
 
 			// Загружаем архив уже скачанных видео
 			archive := loadArchive(filepath.Join(outDir, ".archive.txt"))
