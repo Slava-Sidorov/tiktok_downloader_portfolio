@@ -398,14 +398,14 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
-			fileLinks  := c.String("links")
-			fileProxy  := c.String("proxies")
-			outDir     := c.String("output")
+			fileLinks := c.String("links")
+			fileProxy := c.String("proxies")
+			outDir := c.String("output")
 			numWorkers := c.Int("workers")
-			useSocks5  := c.Bool("socks5")
-			delay      := c.Duration("delay")
-			logPath    := c.String("log")
-			videoSize  := c.Float64("size")
+			useSocks5 := c.Bool("socks5")
+			delay := c.Duration("delay")
+			logPath := c.String("log")
+			videoSize := c.Float64("size")
 
 			verboseMode = c.Bool("verbose")
 
@@ -425,7 +425,7 @@ func main() {
 
 			tools := map[string]string{
 				"yt-dlp": "pip install yt-dlp",
-				"ffmpeg":  "https://ffmpeg.org/download.html",
+				"ffmpeg": "https://ffmpeg.org/download.html",
 			}
 			for bin, hint := range tools {
 				if _, err := exec.LookPath(bin); err != nil {
