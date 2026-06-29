@@ -62,6 +62,34 @@ func TestParseProxy(t *testing.T) {
 			want:   "socks5://1.2.3.4:1080",
 		},
 
+		// IPv6 со схемой — pass-through (требуется полная схема с [])
+		{
+			name:   "http: IPv6 with scheme pass-through",
+			raw:    "http://[2001:db8::1]:8080",
+			scheme: "http",
+			want:   "http://[2001:db8::1]:8080",
+		},
+		{
+			name:   "socks5: IPv6 with scheme pass-through",
+			raw:    "socks5://[2001:db8::1]:1080",
+			scheme: "socks5",
+			want:   "socks5://[2001:db8::1]:1080",
+		},
+
+		// USER:PASS@IP:PORT с паролем, содержащим ':' — ветка с @ не дробит
+		{
+			name:   "http: USER:PASS@IP:PORT password with colon",
+			raw:    "alice:sec:ret@1.2.3.4:8080",
+			scheme: "http",
+			want:   "http://alice:sec:ret@1.2.3.4:8080",
+		},
+		{
+			name:   "socks5: USER:PASS@IP:PORT password with multiple colons",
+			raw:    "bob:p:a:s:s@1.2.3.4:1080",
+			scheme: "socks5",
+			want:   "socks5://bob:p:a:s:s@1.2.3.4:1080",
+		},
+
 		// невалидный формат
 		{
 			name:    "invalid: three parts",
