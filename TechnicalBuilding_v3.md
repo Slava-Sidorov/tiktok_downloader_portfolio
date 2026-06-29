@@ -309,12 +309,88 @@ func logToFile(format string, v ...interface{}) {
 ```go
 var (
     downloaded int64 // реально скачано
-    skipped    int64 // уже существовало (--no-overwrites)
+    skipped    int64 // уже было в архиве
     failed     int64 // окончательная ошибка после всех попыток
 )
 ```
 
-yt-dlp при `--no-overwrites` завершается с кодом 0 и выводит в stderr строку, содержащую `has already been downloaded`. Детектировать это по stderr и инкрементировать `skipped` вместо `downloaded`.
+#### Детектирование уже скачанных видео — через `--download-archive`
+
+Не использовать парсинг stderr и не использовать `filepath.Glob` — оба варианта хрупкие.
+
+**Решение: штатный механизм yt-dlp `--download-archive`.**
+
+yt-dlp пишет в архивный файл ID каждого **успешно и полностью** скачанного видео (формат: `tiktok <videoID>`). При следующем запуске он сверяется с архивом и пропускает уже скачанные без сетевых запросов. Незавершённые загрузки (прерванные Ctrl+C) в архив **не попадают** — при повторе они корректно докачиваются.
+
+**Путь к архиву:** `filepath.Join(outDir, ".archive.txt")` — скрытый файл в папке загрузок.
+
+**Флаг yt-dlp:**
+```go
+"--download-archive", filepath.Join(outDir, ".archive.txt"),
+```
+
+#### Подсчёт `skipped`
+
+Читать архив **один раз при старте** в `map[string]bool` до запуска воркеров:
+
+```go
+func loadArchive(path string) map[string]bool {
+    archive := make(map[string]bool)
+    f, err := os.Open(path)
+    if err != nil {
+        return archive // файла ещё нет — нормально при первом запуске
+    }
+    defer f.Close()
+    sc := bufio.NewScanner(f)
+    for sc.Scan() {
+        // формат строки: "tiktok 7123456789012345678"
+        parts := strings.Fields(sc.Text())
+        if len(parts) == 2 {
+            archive[parts[1]] = true
+        }
+    }
+    return archive
+}
+```
+
+В воркере, **до запуска yt-dlp**, извлечь ID из URL и сверить с архивом:
+
+```go
+func extractTikTokID(rawURL string) string {
+    re := regexp.MustCompile(`/video/(\d+)`)
+    if m := re.FindStringSubmatch(rawURL); len(m) > 1 {
+        return m[1]
+    }
+    return "" // короткие ссылки (vm.tiktok.com) — ID не извлечь
+}
+```
+
+```go
+if id := extractTikTokID(urlLink); id != "" && archive[id] {
+    atomic.AddInt64(&skipped, 1)
+    bar.Add(1)
+    continue // yt-dlp не запускаем
+}
+// иначе запускаем yt-dlp с --download-archive
+// при успехе yt-dlp сам допишет ID в архив → downstream++
+```
+
+Для коротких ссылок (`vm.tiktok.com`) ID не извлекается → пред-чек пропускается → yt-dlp запустится и сам проверит архив по реальному ID. Приемлемый edge case.
+
+#### Дедупликация ссылок при чтении
+
+При загрузке `links.txt` в память дедуплицировать ссылки — один URL не должен обрабатываться дважды в рамках одного запуска:
+
+```go
+seen := make(map[string]bool)
+var urls []string
+for _, line := range lines {
+    if line != "" && !seen[line] {
+        seen[line] = true
+        urls = append(urls, line)
+    }
+}
+```
 
 Финальная строка итогов:
 
@@ -444,7 +520,7 @@ if len(failedURLs) > 0 {
 6. Переписать `main()` в `cli.App` + субкоманда `update`
 7. Чтение всех ссылок в память, инициализация progressbar
 8. Ленивый блэклист + retry (3 попытки) + запись `failed.txt`
-9. Три счётчика статистики (детект пропущенных по stderr)
+9. Три счётчика + progressbar: чтение ссылок в память, дедупликация, init бара, `--download-archive`
 10. Graceful Shutdown: context + select в воркере
 11. Лог в файл через `log.New` с таймстампами (если `--log` задан)
 12. `go build ./...` + ручное тестирование
@@ -467,6 +543,8 @@ if len(failedURLs) > 0 {
 - [ ] Прогресс-бар отображается корректно при параллельных загрузках
 - [ ] Ошибки выводятся без поломки прогресс-бара
 - [ ] Три счётчика: скачано / пропущено / ошибок — все корректны
+- [ ] `--download-archive` передаётся yt-dlp, архив читается при старте в map
+- [ ] Дубли в `links.txt` дедуплицируются при чтении
 - [ ] `Ctrl+C` завершает все дочерние процессы `yt-dlp`, нет зомби
 - [ ] Воркер реагирует на отмену контекста через `select`
 - [ ] Окна `cmd.exe` не всплывают на Windows
