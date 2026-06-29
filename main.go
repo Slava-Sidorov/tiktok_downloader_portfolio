@@ -451,7 +451,11 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 			bar.Add(1)
 
 			if delay > 0 {
-				time.Sleep(delay)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+				}
 			}
 		}
 	}
