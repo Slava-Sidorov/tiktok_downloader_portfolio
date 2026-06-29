@@ -37,12 +37,22 @@ var (
 	verboseMode bool
 	fileLogger  *log.Logger
 
-	bar *progressbar.ProgressBar
+	bar      *progressbar.ProgressBar
+	printMu  sync.Mutex
 
 	blacklist  sync.Map // map[string]struct{} — заблокированные прокси
 	failedMu   sync.Mutex
 	failedURLs []string // ссылки, упавшие после всех попыток
 )
+
+func safePrint(format string, a ...interface{}) {
+	printMu.Lock()
+	defer printMu.Unlock()
+	if bar != nil {
+		bar.Clear()
+	}
+	fmt.Printf(format, a...)
+}
 
 func logToFile(format string, v ...interface{}) {
 	if fileLogger != nil {
@@ -274,8 +284,7 @@ func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) error {
 	err := cmd.Run()
 
 	if err != nil && verboseMode && len(bytes.TrimSpace(stderrBuf.Bytes())) > 0 {
-		bar.Clear()
-		fmt.Printf("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), stderrBuf.String())
+		safePrint("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), stderrBuf.String())
 		logToFile("yt-dlp stderr: %s", stderrBuf.String())
 	}
 
@@ -307,8 +316,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				proxy, ok := nextProxy(proxies, idx)
 				if !ok {
-					bar.Clear()
-					fmt.Printf("[%s] ⛔ W%d | свободных прокси не осталось\n",
+					safePrint("[%s] ⛔ W%d | свободных прокси не осталось\n",
 						time.Now().Format("15:04:05"), id)
 					logToFile("W%d свободных прокси не осталось", id)
 					break
@@ -328,8 +336,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 
 			if !done {
 				atomic.AddInt64(&failed, 1)
-				bar.Clear()
-				fmt.Printf("[%s] ❌ W%d | %.1fs | все попытки исчерпаны: %s\n",
+				safePrint("[%s] ❌ W%d | %.1fs | все попытки исчерпаны: %s\n",
 					time.Now().Format("15:04:05"), id, time.Since(start).Seconds(), urlLink)
 				logToFile("❌ W%d | %.1fs | все попытки: %s", id, time.Since(start).Seconds(), urlLink)
 				failedMu.Lock()
@@ -416,10 +423,7 @@ func main() {
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 			go func() {
 				<-sigCh
-				if bar != nil {
-					bar.Clear()
-				}
-				fmt.Println("\n⚠️  Получен сигнал завершения, останавливаем загрузки...")
+				safePrint("\n⚠️  Получен сигнал завершения, останавливаем загрузки...\n")
 				cancel()
 			}()
 
