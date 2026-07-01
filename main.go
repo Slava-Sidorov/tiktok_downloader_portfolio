@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,9 +28,22 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-const speedTestURL = "https://proof.ovh.net/files/1Mb.dat"
+// speedTestURLs — хосты для замера скорости прокси, пробуются по порядку.
+// Первый ответивший даёт замер: если один хост лежит, авто-режим не падает,
+// пока прокси живые. Каждый файл ~1 МБ. Через --test-url можно поставить свой
+// хост первым в очередь.
+var speedTestURLs = []string{
+	"https://proof.ovh.net/files/1Mb.dat",
+	"https://speed.cloudflare.com/__down?bytes=1048576",
+	"http://speedtest.tele2.net/1MB.zip",
+}
 
 const maxAttempts = 3
+
+// alreadyInArchiveMarker — сообщение yt-dlp, когда видео уже записано в
+// --download-archive: процесс завершается с кодом 0, но реального скачивания
+// не было. Используется, чтобы отличить skipped от downloaded.
+const alreadyInArchiveMarker = "has already been recorded in the archive"
 
 var (
 	downloaded  int64
@@ -37,8 +52,8 @@ var (
 	verboseMode bool
 	fileLogger  *log.Logger
 
-	bar      *progressbar.ProgressBar
-	printMu  sync.Mutex
+	bar     *progressbar.ProgressBar
+	printMu sync.Mutex
 
 	blacklist sync.Map // map[string]struct{} — заблокированные прокси
 	bannedN   int32    // атомарный счётчик забаненных прокси (для раннего выхода в nextProxy)
@@ -63,10 +78,152 @@ func safePrint(format string, a ...interface{}) {
 	fmt.Printf(format, a...)
 }
 
+// barAdd продвигает прогресс-бар под printMu — тем же мьютексом, что и safePrint.
+// Рендер бара и вывод сообщений идут в один stdout, поэтому должны быть
+// сериализованы, иначе строки перемешиваются.
+func barAdd() {
+	printMu.Lock()
+	defer printMu.Unlock()
+	if bar != nil {
+		bar.Add(1)
+	}
+}
+
 func logToFile(format string, v ...interface{}) {
 	if fileLogger != nil {
 		fileLogger.Printf(format, v...)
 	}
+}
+
+// proxyCredRe матчит userinfo в URL-подобной строке: //user:pass@host.
+var proxyCredRe = regexp.MustCompile(`//[^/@\s]+@`)
+
+// maskProxyCreds прячет логин/пароль прокси в произвольном тексте (наш лог или
+// stderr yt-dlp), заменяя //user:pass@ на //***@. Нужно, чтобы креды прокси не
+// оседали открытым текстом в консоли и в файле --log.
+func maskProxyCreds(s string) string {
+	return proxyCredRe.ReplaceAllString(s, "//***@")
+}
+
+// buildTestURLs собирает список хостов для замера в порядке приоритета:
+// разовый --test-url (если задан) → постоянные хосты из конфига (`test-host`)
+// → встроенные fallback-и. Дубликаты убираются, порядок сохраняется.
+func buildTestURLs(custom string) []string {
+	var urls []string
+	if custom != "" {
+		urls = append(urls, custom)
+	}
+	urls = append(urls, loadExtraTestHosts()...)
+	urls = append(urls, speedTestURLs...)
+
+	seen := make(map[string]bool, len(urls))
+	out := urls[:0]
+	for _, u := range urls {
+		if seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	return out
+}
+
+// testHostsConfigPath — путь к файлу с постоянными тест-хостами
+// (%AppData%/tiktok-downloader/test-hosts.txt и аналоги на других ОС).
+func testHostsConfigPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "tiktok-downloader", "test-hosts.txt"), nil
+}
+
+// loadExtraTestHosts читает постоянные тест-хосты. Отсутствие файла — не ошибка
+// (обычная ситуация до первого `test-host`).
+func loadExtraTestHosts() []string {
+	path, err := testHostsConfigPath()
+	if err != nil {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var hosts []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		hosts = append(hosts, line)
+	}
+	return hosts
+}
+
+// addTestHost добавляет хост в постоянный список. Возвращает путь конфига при
+// фактической записи или ("", nil), если хост там уже есть.
+func addTestHost(rawURL string) (string, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return "", fmt.Errorf("пустой URL")
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("нужна полная http/https ссылка, получено: %s", rawURL)
+	}
+
+	for _, h := range loadExtraTestHosts() {
+		if h == rawURL {
+			return "", nil // уже есть — не дублируем
+		}
+	}
+
+	path, err := testHostsConfigPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintln(f, rawURL); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// loadProxies читает файл прокси: пустые строки и комментарии (#) пропускаются,
+// невалидные строки — с предупреждением (креды в нём маскируются). Каждая
+// валидная строка нормализуется через parseProxy под заданную схему.
+func loadProxies(path, scheme string) ([]string, error) {
+	pf, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer pf.Close()
+
+	var proxies []string
+	sc := bufio.NewScanner(pf)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parsed, err := parseProxy(line, scheme)
+		if err != nil {
+			log.Printf("⚠️ Пропускаю невалидный прокси %q: %v", maskProxyCreds(line), err)
+			continue
+		}
+		proxies = append(proxies, parsed)
+	}
+	return proxies, nil
 }
 
 func parseProxy(raw, scheme string) (string, error) {
@@ -92,7 +249,7 @@ func parseProxy(raw, scheme string) (string, error) {
 	}
 }
 
-func testProxySpeed(ctx context.Context, rawProxy, scheme string) (float64, error) {
+func testProxySpeed(ctx context.Context, rawProxy, scheme string, testURLs []string) (float64, error) {
 	proxyURL, err := parseProxy(rawProxy, scheme)
 	if err != nil {
 		return 0, err
@@ -109,7 +266,29 @@ func testProxySpeed(ctx context.Context, rawProxy, scheme string) (float64, erro
 		Timeout: 20 * time.Second,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, speedTestURL, nil)
+	// Пробуем хосты по порядку: падение одного хоста не должно ронять замер,
+	// пока сам прокси живой.
+	var lastErr error
+	for _, testURL := range testURLs {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		speed, err := measureDownload(ctx, client, testURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return speed, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("нет тестовых хостов")
+	}
+	return 0, lastErr
+}
+
+// measureDownload качает один тестовый файл через client и возвращает скорость в МБ/с.
+func measureDownload(ctx context.Context, client *http.Client, testURL string) (float64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -130,15 +309,16 @@ func testProxySpeed(ctx context.Context, rawProxy, scheme string) (float64, erro
 	if duration < 0.1 {
 		duration = 0.1
 	}
-
-	speedMBps := float64(written) / 1024 / 1024 / duration
-	return speedMBps, nil
+	return float64(written) / 1024 / 1024 / duration, nil
 }
 
-func runProxyTest(ctx context.Context, proxies []string, scheme string) (float64, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+// targetWorking — сколько рабочих прокси достаточно найти, чтобы прекратить
+// замер досрочно (в выборочном режиме).
+const targetWorking = 10
 
+// sampleProxies возвращает случайную выборку для теста: max(ceil(10%), 5),
+// но не больше самого пула. Пул перемешивается, оригинал не мутируется.
+func sampleProxies(proxies []string) []string {
 	shuffled := make([]string, len(proxies))
 	copy(shuffled, proxies)
 	rand.Shuffle(len(shuffled), func(i, j int) {
@@ -152,9 +332,14 @@ func runProxyTest(ctx context.Context, proxies []string, scheme string) (float64
 	if maxToTest > len(shuffled) {
 		maxToTest = len(shuffled)
 	}
-	sample := shuffled[:maxToTest]
+	return shuffled[:maxToTest]
+}
 
-	const targetWorking = 10
+func runProxyTest(ctx context.Context, proxies []string, scheme string, testURLs []string) (float64, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sample := sampleProxies(proxies)
 
 	var (
 		found  int32
@@ -180,7 +365,7 @@ func runProxyTest(ctx context.Context, proxies []string, scheme string) (float64
 				return
 			}
 
-			speed, err := testProxySpeed(ctx, proxy, scheme)
+			speed, err := testProxySpeed(ctx, proxy, scheme, testURLs)
 			if err != nil {
 				return
 			}
@@ -210,6 +395,107 @@ func runProxyTest(ctx context.Context, proxies []string, scheme string) (float64
 		sum += s
 	}
 	return sum / float64(len(speeds)), nil
+}
+
+// proxyCheckResult — результат проверки одного прокси для сабкоманды check-proxies.
+type proxyCheckResult struct {
+	proxy string
+	speed float64
+	err   error
+}
+
+// runProxyCheck замеряет скорость прокси и печатает таблицу: живые сверху по
+// убыванию скорости, мёртвые снизу. Ничего не качает и не банит.
+//
+// По умолчанию (all=false) поведение как в основном коде: случайная выборка
+// ~10% пула, ранняя остановка при targetWorking рабочих. С all=true проверяется
+// весь пул.
+func runProxyCheck(ctx context.Context, proxies []string, scheme string, testURLs []string, all bool) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	toTest := proxies
+	if !all {
+		toTest = sampleProxies(proxies)
+	}
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results []proxyCheckResult
+		found   int32
+	)
+	sem := make(chan struct{}, 10)
+
+	for _, p := range toTest {
+		wg.Add(1)
+		go func(proxy string) {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+
+			if ctx.Err() != nil {
+				return
+			}
+
+			speed, err := testProxySpeed(ctx, proxy, scheme, testURLs)
+			mu.Lock()
+			results = append(results, proxyCheckResult{proxy: proxy, speed: speed, err: err})
+			mu.Unlock()
+
+			// Выборочный режим: набрали достаточно рабочих — останавливаем остальные.
+			if err == nil && !all && atomic.AddInt32(&found, 1) >= targetWorking {
+				cancel()
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	// Отменённые досрочной остановкой прокси не мёртвые — их просто не
+	// доуспели проверить, поэтому в таблицу они не попадают.
+	filtered := results[:0]
+	for _, r := range results {
+		if r.err != nil && errors.Is(r.err, context.Canceled) {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	results = filtered
+
+	// Живые первыми, по убыванию скорости; мёртвые — в конец.
+	sort.Slice(results, func(i, j int) bool {
+		li, lj := results[i].err == nil, results[j].err == nil
+		if li != lj {
+			return li
+		}
+		return results[i].speed > results[j].speed
+	})
+
+	working := 0
+	var sum float64
+	for _, r := range results {
+		if r.err == nil {
+			working++
+			sum += r.speed
+			fmt.Printf("✅ %-50s %6.2f МБ/с\n", maskProxyCreds(r.proxy), r.speed)
+		} else {
+			fmt.Printf("❌ %-50s %s\n", maskProxyCreds(r.proxy), maskProxyCreds(r.err.Error()))
+		}
+	}
+
+	scope := fmt.Sprintf("проверено %d из %d", len(results), len(proxies))
+	if all {
+		scope = fmt.Sprintf("весь пул %d", len(proxies))
+	}
+	fmt.Printf("\n🏁 Живых: %d/%d (%s)", working, len(results), scope)
+	if working > 0 {
+		fmt.Printf(" | Средняя скорость: %.2f МБ/с", sum/float64(working))
+	}
+	fmt.Println()
 }
 
 func calculateWorkers(speedMBps float64, videoSizeMB float64) int {
@@ -356,8 +642,9 @@ func resetFail(proxy string) {
 }
 
 // runYtDlp запускает yt-dlp для одной ссылки через указанный прокси.
-// Возвращает stderr наверх, чтобы вызывающий мог классифицировать ошибку.
-func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, error) {
+// Возвращает stdout (для детекта «уже в архиве») и stderr (для классификации
+// ошибки) наверх.
+func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, string, error) {
 	var stdoutBuf, stderrBuf bytes.Buffer
 
 	cmd := exec.CommandContext(ctx, "yt-dlp",
@@ -373,6 +660,7 @@ func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, error
 		"--newline",
 		"--no-check-certificates",
 		"--download-archive", filepath.Join(outDir, ".archive.txt"),
+		"--", // конец опций: ссылка из недоверенного links.txt не должна трактоваться как флаг yt-dlp
 		urlLink,
 	)
 
@@ -384,11 +672,12 @@ func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, error
 
 	stderr := stderrBuf.String()
 	if err != nil && verboseMode && len(bytes.TrimSpace(stderrBuf.Bytes())) > 0 {
-		safePrint("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), stderr)
-		logToFile("yt-dlp stderr: %s", stderr)
+		masked := maskProxyCreds(stderr)
+		safePrint("[%s] yt-dlp stderr:\n%s\n", time.Now().Format("15:04:05"), masked)
+		logToFile("yt-dlp stderr: %s", masked)
 	}
 
-	return stderr, err
+	return stdoutBuf.String(), stderr, err
 }
 
 func worker(ctx context.Context, id int, urls <-chan string, proxies []string, idx *int32, delay time.Duration, outDir string, archive map[string]bool, wg *sync.WaitGroup) {
@@ -406,7 +695,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 			// Детект уже скачанного через локальный архив
 			if videoID := extractTikTokID(urlLink); videoID != "" && archive[videoID] {
 				atomic.AddInt64(&skipped, 1)
-				bar.Add(1)
+				barAdd()
 				continue
 			}
 
@@ -424,11 +713,18 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 					break
 				}
 
-				stderr, err := runYtDlp(ctx, proxy, urlLink, outDir)
+				stdout, stderr, err := runYtDlp(ctx, proxy, urlLink, outDir)
 				if err == nil {
-					atomic.AddInt64(&downloaded, 1)
 					resetFail(proxy) // прокси жив → обнуляем подряд-фейлы
-					logToFile("✅ W%d | %.1fs | %s", id, time.Since(start).Seconds(), urlLink)
+					if strings.Contains(stdout, alreadyInArchiveMarker) {
+						// короткая ссылка (vm.tiktok.com): пред-чек по ID её не поймал,
+						// но yt-dlp сверился с архивом по реальному ID и ничего не качал
+						atomic.AddInt64(&skipped, 1)
+						logToFile("⏭ W%d | уже в архиве | %s", id, urlLink)
+					} else {
+						atomic.AddInt64(&downloaded, 1)
+						logToFile("✅ W%d | %.1fs | %s", id, time.Since(start).Seconds(), urlLink)
+					}
 					done = true
 					break
 				}
@@ -460,7 +756,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 				failedMu.Unlock()
 			}
 
-			bar.Add(1)
+			barAdd()
 
 			if delay > 0 {
 				select {
@@ -523,6 +819,11 @@ func main() {
 				Value: 15.0,
 				Usage: "Примерный размер видео в МБ",
 			},
+			&cli.StringFlag{
+				Name:  "test-url",
+				Value: "",
+				Usage: "Свой хост для замера скорости прокси (пробуется первым, затем встроенные)",
+			},
 		},
 		Action: func(c *cli.Context) error {
 			fileLinks := c.String("links")
@@ -533,8 +834,17 @@ func main() {
 			delay := c.Duration("delay")
 			logPath := c.String("log")
 			videoSize := c.Float64("size")
+			customTestURL := c.String("test-url")
 
 			verboseMode = c.Bool("verbose")
+
+			// Свой хост (если задан) пробуется первым, затем встроенные fallback-и.
+			testURLs := buildTestURLs(customTestURL)
+
+			if numWorkers < 0 {
+				fmt.Printf("❌ --workers должно быть >= 0 (0 = автоопределение), получено %d\n", numWorkers)
+				os.Exit(1)
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -543,8 +853,11 @@ func main() {
 			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 			go func() {
 				<-sigCh
-				safePrint("\n⚠️  Получен сигнал завершения, останавливаем загрузки...\n")
+				safePrint("\n⚠️  Получен сигнал завершения, останавливаем загрузки... (повторный Ctrl+C — принудительный выход)\n")
 				cancel()
+				<-sigCh // второй сигнал: не ждём, пока зависший yt-dlp отпустит соединение
+				safePrint("\n⛔ Принудительный выход\n")
+				os.Exit(130) // 128 + SIGINT
 			}()
 
 			tools := map[string]string{
@@ -577,26 +890,11 @@ func main() {
 			}
 
 			// Читаем прокси
-			pf, err := os.Open(fileProxy)
+			proxies, err := loadProxies(fileProxy, scheme)
 			if err != nil {
 				fmt.Printf("❌ Прокси: %v\n", err)
 				os.Exit(1)
 			}
-			var proxies []string
-			sc := bufio.NewScanner(pf)
-			for sc.Scan() {
-				line := strings.TrimSpace(sc.Text())
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-				parsed, err := parseProxy(line, scheme)
-				if err != nil {
-					log.Printf("⚠️ Пропускаю невалидный прокси %q: %v", line, err)
-					continue
-				}
-				proxies = append(proxies, parsed)
-			}
-			pf.Close()
 			if len(proxies) == 0 {
 				fmt.Println("❌ Прокси пусты")
 				os.Exit(1)
@@ -611,7 +909,7 @@ func main() {
 			recommendedWorkers := numWorkers
 			if numWorkers == 0 {
 				fmt.Println("🧪 Тестирую прокси и замеряю скорость...")
-				avgSpeed, err := runProxyTest(ctx, proxies, scheme)
+				avgSpeed, err := runProxyTest(ctx, proxies, scheme, testURLs)
 				if err != nil {
 					fmt.Println(err)
 					os.Exit(1)
@@ -746,6 +1044,85 @@ func main() {
 					cmd.Stdout = os.Stdout
 					cmd.Stderr = os.Stderr
 					return cmd.Run()
+				},
+			},
+			{
+				Name:  "check-proxies",
+				Usage: "Проверить прокси и вывести живые/мёртвые со скоростью (выборку или весь пул с --all; без скачивания)",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "proxies",
+						Value: "proxies.txt",
+						Usage: "Путь к файлу с прокси",
+					},
+					&cli.BoolFlag{
+						Name:  "socks5",
+						Value: false,
+						Usage: "Использовать socks5 вместо http для прокси",
+					},
+					&cli.StringFlag{
+						Name:  "test-url",
+						Value: "",
+						Usage: "Свой хост для замера (пробуется первым, затем встроенные)",
+					},
+					&cli.BoolFlag{
+						Name:  "all",
+						Value: false,
+						Usage: "Проверить весь пул (по умолчанию — выборка ~10%, до 10 рабочих)",
+					},
+				},
+				Action: func(c *cli.Context) error {
+					scheme := "http"
+					if c.Bool("socks5") {
+						scheme = "socks5"
+					}
+
+					proxies, err := loadProxies(c.String("proxies"), scheme)
+					if err != nil {
+						return fmt.Errorf("прокси: %w", err)
+					}
+					if len(proxies) == 0 {
+						return fmt.Errorf("прокси пусты")
+					}
+
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					sigCh := make(chan os.Signal, 1)
+					signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+					go func() {
+						<-sigCh
+						cancel()
+					}()
+
+					all := c.Bool("all")
+					if all {
+						fmt.Printf("🧪 Проверяю весь пул: %d прокси...\n\n", len(proxies))
+					} else {
+						fmt.Printf("🧪 Проверяю выборку из %d прокси...\n\n", len(proxies))
+					}
+					runProxyCheck(ctx, proxies, scheme, buildTestURLs(c.String("test-url")), all)
+					return nil
+				},
+			},
+			{
+				Name:      "test-host",
+				Usage:     "Добавить хост в постоянный список для замера скорости прокси (не запускает загрузку)",
+				ArgsUsage: "<url>",
+				Action: func(c *cli.Context) error {
+					if c.NArg() != 1 {
+						return fmt.Errorf("укажите ровно один URL: tiktok-downloader test-host <url>")
+					}
+					raw := c.Args().First()
+					path, err := addTestHost(raw)
+					if err != nil {
+						return err
+					}
+					if path == "" {
+						fmt.Printf("ℹ️  Хост уже в списке: %s\n", raw)
+					} else {
+						fmt.Printf("✅ Хост добавлен: %s\n   Сохранён в %s и будет использоваться при тесте прокси.\n", raw, path)
+					}
+					return nil
 				},
 			},
 		},
