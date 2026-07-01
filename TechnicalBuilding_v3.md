@@ -1,561 +1,282 @@
-# ТЗ v3: Модернизация TikTok Auto Video Downloader
+# ТЗ v3.1: TikTok Auto Video Downloader
 
-> **Статус:** Актуальное  
-> **Язык:** Go  
-> **Версия документа:** 3.0  
-> **Дата:** 2026-06-27  
-> **Заменяет:** TechnicalBuilding_1.md, TechnicalBuilding_2.md
+> **Статус:** Актуальное (описывает фактическую реализацию)
+> **Язык:** Go
+> **Версия документа:** 3.1
+> **Дата:** 2026-07-01
+> **Заменяет:** TechnicalBuilding_1.md, TechnicalBuilding_2.md, ТЗ v3.0
+
+---
+
+## 0. Изменения относительно v3.0
+
+v3.0 описывала целевой рефакторинг. v3.1 приводит документ в соответствие с кодом
+после доработок:
+
+- **Разделитель `--`** перед ссылкой в вызове yt-dlp — защита от argument injection
+  из недоверённого `links.txt`.
+- **Детект `skipped` через stdout yt-dlp** (`has already been recorded in the archive`),
+  а не только через пред-чек по ID — короткие ссылки считаются пропущенными корректно.
+- **`bar.Add` под `printMu`** — рендер бара и сообщения сериализованы.
+- **Валидация `--workers`** — отрицательное значение отклоняется.
+- **Fallback-хосты для замера** — список вместо одного URL; первый ответивший даёт замер.
+- **Флаг `--test-url`** — разовый хост для замера.
+- **Сабкоманда `test-host <url>`** — постоянный хост в конфиге пользователя.
+- **Сабкоманда `check-proxies`** — диагностика прокси (выборка по умолчанию, `--all` — весь пул).
+- **Маскировка кредов прокси** (`//***@`) в консоли, `--log` и `check-proxies`.
+- **Форс-выход по второму `Ctrl+C`** (`os.Exit(130)`).
 
 ---
 
 ## 1. Контекст и цель
 
-Существующий проект — CLI-утилита на Go для автоматической загрузки видео из TikTok через `yt-dlp`. Ядро (Worker Pool, `calculateWorkers`, `testProxySpeed`) работает стабильно и **не переписывается**.
-
-**Цель:** перевести утилиту из статуса «скрипт под себя» в production-ready инструмент для фриланс-клиентов (RU и EN рынки). Улучшить UX, надёжность, кроссплатформенность и качество работы с прокси.
-
----
-
-## 2. Задачи
-
-### 2.1 Pre-flight проверки зависимостей
-
-При старте программы, **до любых других действий**, проверить наличие внешних зависимостей через `exec.LookPath`.
-
-```go
-tools := map[string]string{
-    "yt-dlp": "pip install yt-dlp",
-    "ffmpeg":  "https://ffmpeg.org/download.html",
-}
-for bin, hint := range tools {
-    if _, err := exec.LookPath(bin); err != nil {
-        fmt.Printf("❌ %s не найден. Установите: %s\n", bin, hint)
-        os.Exit(1)
-    }
-}
-```
-
-Если хоть одна зависимость отсутствует — завершить программу с понятным сообщением. Не запускать тест прокси и не читать файлы ссылок.
+CLI-утилита на Go для массовой загрузки видео из TikTok через `yt-dlp` и пул прокси.
+Ядро (Worker Pool, `calculateWorkers`, замер скорости) стабильно и не переписывается.
+Цель — production-ready инструмент для фриланс-клиентов (RU/EN): UX, надёжность,
+кроссплатформенность, аккуратная работа с прокси.
 
 ---
 
-### 2.2 Переход с `flag` на `urfave/cli`
+## 2. Внешние зависимости
 
-**Зависимость:** `github.com/urfave/cli/v2`
+- `github.com/urfave/cli/v2` — CLI (флаги, сабкоманды).
+- `github.com/schollz/progressbar/v3` — прогресс-бар.
+- Внешние бинарники в `PATH`: `yt-dlp`, `ffmpeg`.
 
-Заменить текущую инициализацию через пакет `flag` на структуру `cli.App`.
+### Pre-flight проверки
 
-#### Глобальные флаги
+При старте основного режима, до чтения файлов и замера, проверяются `yt-dlp` и
+`ffmpeg` через `exec.LookPath`. Отсутствие любого — понятное сообщение и `os.Exit(1)`.
+
+---
+
+## 3. CLI
+
+### 3.1 Флаги основного режима
 
 | Флаг | Тип | Default | Описание |
 |---|---|---|---|
-| `--links` | string | `links.txt` | Путь к файлу со ссылками |
-| `--proxies` | string | `proxies.txt` | Путь к файлу с прокси |
-| `--output` | string | `./downloads` | Папка для сохранения видео |
-| `--workers` | int | `0` | Кол-во воркеров (0 = автоопределение) |
-| `--socks5` | bool | `false` | Использовать socks5 вместо http для прокси |
-| `--delay` | duration | `500ms` | Задержка между запросами одного воркера |
-| `--log` | string | `""` | Путь к файлу лога (если не указан — только консоль) |
-| `--verbose` | bool | `false` | Подробный вывод yt-dlp для каждого видео |
+| `--links` | string | `links.txt` | Файл со ссылками |
+| `--proxies` | string | `proxies.txt` | Файл с прокси |
+| `--output` | string | `./downloads` | Папка сохранения |
+| `--workers` | int | `0` | Воркеры (0 = автоопределение; `< 0` → ошибка и выход) |
+| `--socks5` | bool | `false` | socks5 вместо http для прокси без схемы |
+| `--delay` | duration | `500ms` | Задержка между запросами воркера |
+| `--log` | string | `""` | Файл лога (без флага — только консоль) |
+| `--verbose` | bool | `false` | Подробный вывод yt-dlp |
+| `--size` | float64 | `15.0` | Примерный размер видео, МБ |
+| `--test-url` | string | `""` | Разовый хост для замера скорости (первым в очереди) |
 
-#### Структура `main.go`
+### 3.2 Сабкоманды
 
-```go
-app := &cli.App{
-    Name:  "tiktok-downloader",
-    Usage: "Массовое скачивание видео из TikTok через yt-dlp",
-    Flags: []cli.Flag{ /* см. таблицу выше */ },
-    Action: func(c *cli.Context) error {
-        // вся логика main() переезжает сюда
-        return nil
-    },
-    Commands: []*cli.Command{
-        {
-            Name:  "update",
-            Usage: "Обновить yt-dlp до последней версии",
-            Action: func(c *cli.Context) error {
-                cmd := exec.Command("yt-dlp", "-U")
-                cmd.Stdout = os.Stdout
-                cmd.Stderr = os.Stderr
-                return cmd.Run()
-            },
-        },
-    },
-}
-```
+- `update` — `yt-dlp -U` с трансляцией вывода.
+- `check-proxies [--proxies] [--socks5] [--test-url] [--all]` — диагностика (см. §7).
+- `test-host <url>` — постоянный тест-хост (см. §6.2).
 
 ---
 
-### 2.3 Умный парсинг прокси (`parseProxy`)
+## 4. Парсинг прокси (`parseProxy`)
 
-Поддержать четыре формата входной строки. Протокол определяется глобальным флагом `--socks5` (default: `http`). Если строка уже содержит схему — не переопределять.
-
-#### Форматы
+Четыре формата; протокол для строк без схемы — из `--socks5` (default `http`).
+Строка со схемой (`http://`, `socks5://`) — pass-through.
 
 | Формат | Пример |
 |---|---|
-| Готовый URL (pass-through) | `http://alice:secret@1.2.3.4:8080` |
+| Готовый URL | `http://alice:secret@1.2.3.4:8080` |
 | `USER:PASS@IP:PORT` | `alice:secret@1.2.3.4:8080` |
 | `IP:PORT:USER:PASS` | `1.2.3.4:8080:alice:secret` |
 | `IP:PORT` | `1.2.3.4:8080` |
 
-#### Логика разбора (приоритетный порядок)
+Логика: наличие схемы → pass-through; наличие `@` → `scheme://` + строка (пароль с
+`:` не дробится); иначе `strings.Split(raw, ":")` — 2 части `IP:PORT`, 4 части
+`IP:PORT:USER:PASS`, иначе ошибка.
 
-```go
-func parseProxy(raw, scheme string) (string, error) {
-    raw = strings.TrimSpace(raw)
+**Чтение файла (`loadProxies`):** пустые строки и `#`-комментарии пропускаются;
+невалидные строки — предупреждение (с маскировкой кредов) и пропуск, без падения.
 
-    // 1. Уже есть схема — пропустить как есть
-    if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "socks5://") {
-        return raw, nil
-    }
-
-    // 2. Формат USER:PASS@IP:PORT
-    if strings.Contains(raw, "@") {
-        return scheme + "://" + raw, nil
-    }
-
-    parts := strings.Split(raw, ":")
-
-    switch len(parts) {
-    case 2:
-        // Формат IP:PORT
-        return fmt.Sprintf("%s://%s:%s", scheme, parts[0], parts[1]), nil
-    case 4:
-        // Формат IP:PORT:USER:PASS
-        return fmt.Sprintf("%s://%s:%s@%s:%s", scheme, parts[2], parts[3], parts[0], parts[1]), nil
-    default:
-        return "", fmt.Errorf("неизвестный формат прокси: %s", raw)
-    }
-}
-```
-
-#### Правила чтения файла прокси
-
-- Пустые строки — игнорировать.
-- Строки начинающиеся с `#` — игнорировать (комментарии).
-- Невалидные строки — пропускать с выводом предупреждения, не крашить программу.
+**Ограничения:** пароль с `:` — только через формат с `@` или полный URL; голый
+IPv6 не поддерживается (нужна схема с `[]`).
 
 ---
 
-### 2.4 Умное тестирование прокси
+## 5. Замер скорости и автоопределение воркеров
 
-Выполняется при старте, **только если `--workers` не задан вручную**. Цель — найти рабочие прокси и вычислить среднюю скорость для `calculateWorkers`.
+Выполняется, только если `--workers 0`.
 
-#### Алгоритм
-
-```
-1. Перемешать весь список прокси (math/rand.Shuffle)
-2. max_to_test = max(ceil(len(proxies) * 0.10), 5)
-3. Взять первые max_to_test прокси из перемешанного списка
-4. Запустить 5 горутин-тестировщиков (семафор chan struct{})
-5. Атомарный счётчик found — при достижении 10 вызвать cancel()
-6. Собрать скорости всех рабочих прокси
-7. avgSpeed = sum(speeds) / len(speeds)
-8. Передать avgSpeed в calculateWorkers
-```
-
-#### Hard fail при 0 рабочих
-
-Если ни один прокси из выборки не прошёл тест:
+### Выборка (`sampleProxies`)
 
 ```
-❌ Ни один прокси из выборки не работает.
-   Перезапустите программу для повторного теста
-   или проверьте валидность прокси в файле.
+shuffle(proxies)
+maxToTest = clamp(ceil(len*0.10), min=5, max=len)
+sample = shuffled[:maxToTest]
 ```
 
-Завершить программу с `os.Exit(1)`.
+Практика: пул > 50 → ~10%; пул 5–50 → 5; пул < 5 → весь пул.
 
-#### Адаптация `testProxySpeed`
+### Замер (`runProxyTest`)
 
-Функция должна принимать `context.Context` для корректной отмены при достижении лимита:
+- параллелизм 5 (семафор);
+- каждый прокси меряется через `testProxySpeed`;
+- атомарный счётчик рабочих; при **10** рабочих — `cancel()` (досрочная остановка);
+- средняя скорость рабочих → `calculateWorkers` (диапазон **1–20**, `targetTime=10s`);
+- если 0 рабочих — сообщение и `os.Exit(1)`.
 
-```go
-func testProxySpeed(ctx context.Context, rawProxy, scheme string) (float64, error)
-```
+### `testProxySpeed` / `measureDownload`
 
-URL тестового файла вынести в константу:
-
-```go
-const speedTestURL = "https://proof.ovh.net/files/1Mb.dat"
-```
+`testProxySpeed(ctx, rawProxy, scheme, testURLs)` строит `http.Client` с прокси и
+таймаутом 20s, затем пробует `testURLs` по порядку (`measureDownload`): первый
+успешный даёт скорость (МБ/с). При отмене контекста — ранний возврат.
 
 ---
 
-### 2.5 Стратегия прокси при скачивании: ленивый блэклист + retry
+## 6. Тестовые хосты
 
-#### Блэклист
+### 6.1 Порядок (`buildTestURLs`)
 
-Хранить заблокированные прокси в потокобезопасной структуре:
+1. `--test-url` (если задан);
+2. постоянные из конфига (`loadExtraTestHosts`);
+3. встроенные `speedTestURLs` (ovh, cloudflare, tele2).
 
-```go
-var blacklist sync.Map // map[string]struct{}
-```
+Дубликаты убираются, порядок сохраняется.
 
-Функция выбора следующего прокси пропускает заблокированные:
+### 6.2 Постоянные хосты (`test-host`)
 
-```go
-func nextProxy(proxies []string, idx *int32) (string, bool) {
-    for range proxies {
-        i := int(atomic.AddInt32(idx, 1)) % len(proxies)
-        p := proxies[i]
-        if _, banned := blacklist.Load(p); !banned {
-            return p, true
-        }
-    }
-    return "", false // все прокси в блэклисте
-}
-```
-
-Если yt-dlp вернул ошибку — добавить использованный прокси в блэклист:
-
-```go
-blacklist.Store(proxy, struct{}{})
-```
-
-Если `nextProxy` не нашёл ни одного свободного — завершить загрузку с ошибкой.
-
-#### Retry упавших ссылок
-
-Каждая ссылка получает максимум **3 попытки** (первая + 2 retry) на разных прокси (блэклист гарантирует смену прокси).
-
-```go
-const maxAttempts = 3
-
-for attempt := 1; attempt <= maxAttempts; attempt++ {
-    proxy, ok := nextProxy(proxies, &proxyIdx)
-    if !ok {
-        // все прокси мертвы
-        break
-    }
-    err := runYtDlp(ctx, proxy, urlLink, outDir)
-    if err == nil {
-        // успех
-        break
-    }
-    blacklist.Store(proxy, struct{}{})
-}
-```
-
-После 3 неудачных попыток — записать ссылку в `failed.txt`.
+- Хранилище: `os.UserConfigDir()/tiktok-downloader/test-hosts.txt`, по одному URL/строку.
+- `addTestHost`: валидирует полную `http`/`https` ссылку, не пишет дубликаты,
+  создаёт директорию/файл при необходимости (append).
+- Сабкоманда выводит путь конфига и не запускает загрузку.
 
 ---
 
-### 2.6 Прогресс-бар и логирование
+## 7. `check-proxies` (диагностика)
 
-**Зависимость:** `github.com/schollz/progressbar/v3`
+`runProxyCheck(ctx, proxies, scheme, testURLs, all)`:
 
-#### Что убрать
-
-- Функцию `safeLog` — удалить.
-- `sync.Mutex logMutex` — удалить.
-
-#### Инициализация прогресс-бара
-
-Файл ссылок читать **полностью в память** до запуска воркеров — чтобы знать `totalVideos` для прогресс-бара.
-
-```go
-bar := progressbar.NewOptions(totalVideos,
-    progressbar.OptionSetDescription("Загрузка видео"),
-    progressbar.OptionShowCount(),
-    progressbar.OptionSetTheme(progressbar.Theme{
-        Saucer: "=", SaucerHead: ">", SaucerPadding: " ",
-        BarStart: "[", BarEnd: "]",
-    }),
-)
-```
-
-После каждого завершённого видео (успех, пропуск или окончательная ошибка) вызывать `bar.Add(1)`.
-
-#### Вывод ошибок без поломки бара
-
-Нельзя использовать `fmt.Println` напрямую — сломает отрисовку. Использовать:
-
-```go
-bar.Clear()
-fmt.Printf("[%s] ❌ Ошибка: %v\n", time.Now().Format("15:04:05"), err)
-```
-
-#### Лог в файл
-
-Лог пишется **только при наличии флага `--log`**. Реализовать через `log.New` — он потокобезопасен:
-
-```go
-var fileLogger *log.Logger
-
-if logPath != "" {
-    f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    if err != nil { /* handle */ }
-    defer f.Close()
-    fileLogger = log.New(f, "", log.LstdFlags) // LstdFlags добавляет дату и время
-}
-
-func logToFile(format string, v ...interface{}) {
-    if fileLogger != nil {
-        fileLogger.Printf(format, v...)
-    }
-}
-```
-
-Таймстампы в логе обеспечиваются флагом `log.LstdFlags` (формат: `2009/11/10 23:00:00`).
+- `all=false` (default) — выборка `sampleProxies`, ранняя остановка при `targetWorking`
+  рабочих; `all=true` — весь пул;
+- параллелизм 10;
+- прокси, отменённые досрочной остановкой (`context.Canceled`), **не** попадают в
+  таблицу (не помечаются мёртвыми);
+- вывод: живые сверху по убыванию скорости, мёртвые снизу с причиной; креды маскируются;
+- итог: `Живых: X/Y (охват)` + средняя скорость живых.
+- Ничего не качает и не банит.
 
 ---
 
-### 2.7 Три счётчика статистики
+## 8. Стратегия прокси при скачивании
 
-Заменить текущие два счётчика (`success`, `failed`) на три:
+### Блэклист + мягкий бан
 
-```go
-var (
-    downloaded int64 // реально скачано
-    skipped    int64 // уже было в архиве
-    failed     int64 // окончательная ошибка после всех попыток
-)
-```
+- `blacklist sync.Map` — забаненные; `failCount sync.Map` — подряд-фейлы по прокси;
+  `bannedN int32` — атомарный счётчик для раннего выхода в `nextProxy`.
+- `nextProxy(proxies, idx)` — следующий не забаненный по кругу (общий атомарный `idx`);
+  если `bannedN >= len(proxies)` — сразу `("", false)`.
+- `incFailAndMaybeBan`: +1 к счётчику; при `failsToBan = 2` подряд — бан ровно один раз
+  (`blacklist.LoadOrStore`), счётчик обнуляется.
+- `resetFail`: успех обнуляет счётчик подряд-фейлов.
 
-#### Детектирование уже скачанных видео — через `--download-archive`
+### Классификация ошибок (`classifyYtdlpError`)
 
-Не использовать парсинг stderr и не использовать `filepath.Glob` — оба варианта хрупкие.
+Стратегия «от обратного»: сначала стабильные **video-маркеры** (`errVideo` — видео не
+оживёт от смены прокси, ретрай бессмысленен), иначе **`errProxy`** (сеть/прокси).
+`proxyReasons` — только для человекочитаемой причины, на логику бана не влияют.
 
-**Решение: штатный механизм yt-dlp `--download-archive`.**
+### Retry (`worker`)
 
-yt-dlp пишет в архивный файл ID каждого **успешно и полностью** скачанного видео (формат: `tiktok <videoID>`). При следующем запуске он сверяется с архивом и пропускает уже скачанные без сетевых запросов. Незавершённые загрузки (прерванные Ctrl+C) в архив **не попадают** — при повторе они корректно докачиваются.
+Каждая ссылка — максимум `maxAttempts = 3` попыток:
 
-**Путь к архиву:** `filepath.Join(outDir, ".archive.txt")` — скрытый файл в папке загрузок.
+1. `nextProxy`; если свободных нет — стоп, ссылка в `failed`.
+2. `runYtDlp`. Успех → `resetFail`, счётчик `skipped`/`downloaded` (см. §9), стоп.
+3. `errVideo` → в `failed` с причиной, без ретраев.
+4. `errProxy` → `incFailAndMaybeBan`, причина в консоль/лог, следующая попытка.
 
-**Флаг yt-dlp:**
-```go
-"--download-archive", filepath.Join(outDir, ".archive.txt"),
-```
-
-#### Подсчёт `skipped`
-
-Читать архив **один раз при старте** в `map[string]bool` до запуска воркеров:
-
-```go
-func loadArchive(path string) map[string]bool {
-    archive := make(map[string]bool)
-    f, err := os.Open(path)
-    if err != nil {
-        return archive // файла ещё нет — нормально при первом запуске
-    }
-    defer f.Close()
-    sc := bufio.NewScanner(f)
-    for sc.Scan() {
-        // формат строки: "tiktok 7123456789012345678"
-        parts := strings.Fields(sc.Text())
-        if len(parts) == 2 {
-            archive[parts[1]] = true
-        }
-    }
-    return archive
-}
-```
-
-В воркере, **до запуска yt-dlp**, извлечь ID из URL и сверить с архивом:
-
-```go
-func extractTikTokID(rawURL string) string {
-    re := regexp.MustCompile(`/video/(\d+)`)
-    if m := re.FindStringSubmatch(rawURL); len(m) > 1 {
-        return m[1]
-    }
-    return "" // короткие ссылки (vm.tiktok.com) — ID не извлечь
-}
-```
-
-```go
-if id := extractTikTokID(urlLink); id != "" && archive[id] {
-    atomic.AddInt64(&skipped, 1)
-    bar.Add(1)
-    continue // yt-dlp не запускаем
-}
-// иначе запускаем yt-dlp с --download-archive
-// при успехе yt-dlp сам допишет ID в архив → downstream++
-```
-
-Для коротких ссылок (`vm.tiktok.com`) ID не извлекается → пред-чек пропускается → yt-dlp запустится и сам проверит архив по реальному ID. Приемлемый edge case.
-
-#### Дедупликация ссылок при чтении
-
-При загрузке `links.txt` в память дедуплицировать ссылки — один URL не должен обрабатываться дважды в рамках одного запуска:
-
-```go
-seen := make(map[string]bool)
-var urls []string
-for _, line := range lines {
-    if line != "" && !seen[line] {
-        seen[line] = true
-        urls = append(urls, line)
-    }
-}
-```
-
-Финальная строка итогов:
-
-```
-🏁 Готово | ✅ Скачано: X | ⏭ Пропущено: Y | ❌ Ошибок: Z
-```
+> Бан только после 2 фейлов **подряд по одному прокси** при round-robin `idx` не
+> гарантирует 3 разных прокси на одну ссылку — на маленьком пуле возможен повтор.
 
 ---
 
-### 2.8 Graceful Shutdown
+## 9. Запуск yt-dlp (`runYtDlp`)
 
-При нажатии `Ctrl+C` все запущенные процессы `yt-dlp` должны завершиться, новые загрузки не начинаться.
+Ключевые аргументы: формат `bestvideo*+bestaudio/best`, merge в mp4, `-o %(id)s.%(ext)s`,
+`--proxy`, `--socket-timeout 20`, `--retries 2`, `--concurrent-fragments 4`,
+`--no-overwrites`, `--no-playlist`, `--newline`, `--no-check-certificates`,
+`--download-archive <out>/.archive.txt`, затем **`--`** и ссылка.
 
-```go
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
+- `--` отделяет опции от ссылки: строка из недоверённого `links.txt`, начинающаяся с
+  `-`, не станет опцией yt-dlp.
+- Возвращает stdout и stderr. При `--verbose` и ошибке — stderr в консоль/лог с
+  **маскировкой кредов** (`maskProxyCreds`).
+- Кроссплатформенно скрывает окно консоли на Windows (`setSysProcAttr`, build tags
+  `exec_windows.go` / `exec_unix.go`).
 
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+### Счётчики и архив
 
-go func() {
-    <-sigCh
-    bar.Clear()
-    fmt.Println("\n⚠️  Получен сигнал завершения, останавливаем загрузки...")
-    cancel()
-}()
-```
-
-Заменить `exec.Command` на `exec.CommandContext(ctx, "yt-dlp", ...)` — процесс убьётся автоматически при отмене контекста.
-
-#### Корректный выход из воркера
-
-Текущий цикл `for url := range urls` не реагирует на отмену контекста. Заменить на:
-
-```go
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case urlLink, ok := <-urls:
-        if !ok {
-            return
-        }
-        // логика скачивания
-    }
-}
-```
-
-После завершения всех горутин — записать `failed.txt` и вывести итоговую статистику.
+- `loadArchive` читает `.archive.txt` в `map` при старте (строки `tiktok <id>`).
+- В воркере пред-чек: `extractTikTokID` + `archive[id]` → `skipped`, yt-dlp не запускается.
+- Короткие ссылки (`vm.tiktok.com`): ID не извлечь → yt-dlp запускается, но если он
+  сообщает `has already been recorded in the archive` (stdout) — засчитывается `skipped`,
+  иначе `downloaded`.
+- Дедупликация `links.txt` при чтении через `dedupKey` (по TikTok-ID, иначе по
+  нормализованному URL без query/fragment).
+- Три счётчика: `downloaded` / `skipped` / `failed`.
 
 ---
 
-### 2.9 Кроссплатформенность: подавление окон cmd.exe на Windows
+## 10. Прогресс-бар и логирование
 
-При запуске `yt-dlp` через `exec.Command` на Windows открывается консольное окно. Решение — build tags.
-
-**`exec_windows.go`**
-```go
-//go:build windows
-
-package main
-
-import (
-    "os/exec"
-    "syscall"
-)
-
-func setSysProcAttr(cmd *exec.Cmd) {
-    cmd.SysProcAttr = &syscall.SysProcAttr{
-        HideWindow:    true,
-        CreationFlags: 0x08000000, // CREATE_NO_WINDOW
-    }
-}
-```
-
-**`exec_unix.go`**
-```go
-//go:build !windows
-
-package main
-
-import "os/exec"
-
-func setSysProcAttr(cmd *exec.Cmd) {
-    // no-op на Linux/macOS
-}
-```
-
-Вызывать `setSysProcAttr(cmd)` перед каждым `cmd.Run()` в воркере.
+- `bar` инициализируется под `printMu` (sig-handler читает его через `safePrint`).
+- `safePrint` — вывод сообщений под `printMu` с `bar.Clear()`.
+- `barAdd` — `bar.Add(1)` под тем же `printMu` (сериализация с выводом сообщений).
+- Каждая ссылка ровно один раз двигает бар (пропуск/успех/финальная ошибка).
+- Лог в файл — только при `--log`, через `log.New(..., log.LstdFlags)` (потокобезопасно).
 
 ---
 
-### 2.10 `failed.txt`
+## 11. Graceful shutdown
 
-После завершения всех воркеров, если есть ссылки, которые не удалось скачать после всех попыток — записать их в файл `failed.txt` в директории `--output`.
-
-```go
-if len(failedURLs) > 0 {
-    path := filepath.Join(outDir, "failed.txt")
-    f, _ := os.Create(path)
-    defer f.Close()
-    for _, u := range failedURLs {
-        fmt.Fprintln(f, u)
-    }
-    fmt.Printf("📄 Список упавших ссылок сохранён: %s\n", path)
-}
-```
+- `context.WithCancel`; `signal.Notify(os.Interrupt, SIGTERM)`.
+- Первый сигнал: сообщение, `cancel()` → `exec.CommandContext` убивает дочерние yt-dlp,
+  фидер ссылок и воркеры выходят по `ctx.Done()`.
+- **Второй сигнал:** `os.Exit(130)` — форс, если yt-dlp завис на закрытии соединения.
+- После воркеров пишутся `failed.txt` / `failed_reasons.txt` и итоговая статистика.
 
 ---
 
-## 3. Что не меняется
+## 12. Файлы результатов (`--output`)
 
-- Язык: Go
-- Инструмент загрузки: `yt-dlp` (внешний процесс)
-- Хранение: локальная папка
-- Функции `calculateWorkers` и `testProxySpeed` — только расширяются (добавляется `context`, `scheme`), логика не переписывается
-
----
-
-## 4. Порядок реализации
-
-1. `go get github.com/urfave/cli/v2 github.com/schollz/progressbar/v3`
-2. Pre-flight проверки (`yt-dlp`, `ffmpeg`)
-3. `parseProxy` с четырьмя форматами и флагом `--socks5`
-4. Умный тест прокси (shuffle, 5 горутин, 10 рабочих, hard fail)
-5. Build tags: `exec_windows.go` / `exec_unix.go`
-6. Переписать `main()` в `cli.App` + субкоманда `update`
-7. Чтение всех ссылок в память, инициализация progressbar
-8. Ленивый блэклист + retry (3 попытки) + запись `failed.txt`
-9. Три счётчика + progressbar: чтение ссылок в память, дедупликация, init бара, `--download-archive`
-10. Graceful Shutdown: context + select в воркере
-11. Лог в файл через `log.New` с таймстампами (если `--log` задан)
-12. `go build ./...` + ручное тестирование
+- `failed.txt` — чистый список упавших URL для повторного прогона.
+- `failed_reasons.txt` — `URL\tпричина`.
+- `.archive.txt` — архив yt-dlp (скрытый), основа для `skipped`.
 
 ---
 
-## 5. Критерии готовности
+## 13. Безопасность
 
-- [ ] При отсутствии `yt-dlp` или `ffmpeg` — понятное сообщение с инструкцией, выход
-- [ ] `flag` полностью удалён, все параметры через `urfave/cli`
-- [ ] `tiktok-downloader update` запускает `yt-dlp -U` и транслирует вывод
-- [ ] Все четыре формата прокси парсятся корректно
-- [ ] `--socks5` переключает протокол для всех прокси без явной схемы
-- [ ] Комментарии (`#`) и пустые строки в файле прокси игнорируются
-- [ ] Тест прокси: рандомная выборка, 5 горутин, стоп при 10 рабочих
-- [ ] Hard fail с понятным сообщением если 0 рабочих прокси
-- [ ] Дохлые прокси попадают в блэклист и не переиспользуются
-- [ ] Каждая ссылка получает максимум 3 попытки на разных прокси
-- [ ] Окончательно упавшие ссылки записываются в `failed.txt`
-- [ ] Прогресс-бар отображается корректно при параллельных загрузках
-- [ ] Ошибки выводятся без поломки прогресс-бара
-- [ ] Три счётчика: скачано / пропущено / ошибок — все корректны
-- [ ] `--download-archive` передаётся yt-dlp, архив читается при старте в map
-- [ ] Дубли в `links.txt` дедуплицируются при чтении
-- [ ] `Ctrl+C` завершает все дочерние процессы `yt-dlp`, нет зомби
-- [ ] Воркер реагирует на отмену контекста через `select`
-- [ ] Окна `cmd.exe` не всплывают на Windows
-- [ ] `go build ./...` — без ошибок на Windows и Linux/macOS
-- [ ] При флаге `--log` пишется файл с таймстампами; без флага — не пишется
+- **Argument injection:** ссылка передаётся после `--` (§9).
+- **Маскировка кредов:** `//user:pass@` → `//***@` в консоли, `--log`, `check-proxies`,
+  предупреждениях о невалидных прокси.
+- **TLS:** `--no-check-certificates` — риск MITM через недоверенные прокси (см. README).
 
 ---
 
-## 6. Заметки
+## 14. Что не меняется
 
-- Этот файл — единственный источник истины по требованиям. TechnicalBuilding_1.md и TechnicalBuilding_2.md считать устаревшими.
-- Перед рефакторингом сохранить текущий `main.go` как `main_legacy.go` или в ветке `legacy`.
-- Если требование конфликтует с кодовой базой — зафиксировать здесь и уточнить у владельца.
+- Язык Go; загрузка через внешний `yt-dlp`; хранение — локальная папка.
+- `calculateWorkers` и логика замера — только расширяются (context, схема, список хостов).
+
+---
+
+## 15. Тесты
+
+- `proxy_parse_test.go` — table-driven тесты `parseProxy` (все форматы, IPv6 со схемой,
+  пароль с `:`, невалидные строки).
+- Проверки перед сдачей: `gofmt -l`, `go vet ./...`, `go build ./...`, `go test ./...`
+  (при доступном C-компиляторе — `go test -race ./...`).
+
+---
+
+## 16. Заметки
+
+- Этот файл — единственный источник истины по требованиям. v1/v2/v3.0 устарели.
+- Если требование конфликтует с кодом — фиксировать здесь и уточнять у владельца.
 - Изменения добавлять с датой и пометкой `[обновлено YYYY-MM-DD]`.
