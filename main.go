@@ -226,6 +226,26 @@ func loadProxies(path, scheme string) ([]string, error) {
 	return proxies, nil
 }
 
+// loadOrSkipProxies читает и валидирует пул прокси в обычном режиме. В --no-proxy
+// прокси не нужны: файл не читается (с предупреждением, если --proxies был задан
+// явно), возвращается пустой список. Пустой пул в обычном режиме — ошибка.
+func loadOrSkipProxies(noProxy, proxiesSet bool, path, scheme string) ([]string, error) {
+	if noProxy {
+		if proxiesSet {
+			fmt.Println("⚠️  --no-proxy: файл прокси игнорируется")
+		}
+		return nil, nil
+	}
+	proxies, err := loadProxies(path, scheme)
+	if err != nil {
+		return nil, err
+	}
+	if len(proxies) == 0 {
+		return nil, fmt.Errorf("прокси пусты")
+	}
+	return proxies, nil
+}
+
 func parseProxy(raw, scheme string) (string, error) {
 	raw = strings.TrimSpace(raw)
 
@@ -531,16 +551,71 @@ func loadArchive(path string) map[string]bool {
 	return archive
 }
 
+// tiktokVideoIDRe — числовой ID видео в пути /video/<id>.
+var tiktokVideoIDRe = regexp.MustCompile(`/video/(\d+)`)
+
 func extractTikTokID(rawURL string) string {
-	re := regexp.MustCompile(`/video/(\d+)`)
-	if m := re.FindStringSubmatch(rawURL); len(m) > 1 {
+	if m := tiktokVideoIDRe.FindStringSubmatch(rawURL); len(m) > 1 {
 		return m[1]
 	}
 	return ""
 }
 
-func dedupKey(rawURL string) string {
-	if id := extractTikTokID(rawURL); id != "" {
+// ytWatchIDRe / ytPathIDRe — 11-символьный YouTube video ID в разных формах.
+var (
+	ytWatchIDRe = regexp.MustCompile(`[?&]v=([A-Za-z0-9_-]{11})`)
+	ytPathIDRe  = regexp.MustCompile(`(?:youtu\.be/|/shorts/|/embed/|/v/)([A-Za-z0-9_-]{11})`)
+)
+
+// extractYouTubeID достаёт video ID из форм watch?v=, youtu.be/, shorts/, embed/,
+// /v/. Плейлисты, индексы и таймкоды игнорируются — важен только сам ID.
+func extractYouTubeID(rawURL string) string {
+	if m := ytWatchIDRe.FindStringSubmatch(rawURL); len(m) > 1 {
+		return m[1]
+	}
+	if m := ytPathIDRe.FindStringSubmatch(rawURL); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// videoMarker — подстрока stderr yt-dlp, означающая «видео не оживёт» (errVideo),
+// и человекочитаемая причина.
+type videoMarker struct{ marker, reason string }
+
+// platformProfile инкапсулирует всё платформо-специфичное: извлечение
+// канонического ID (для пред-чека по архиву и дедупа) и маркеры video-ошибок.
+// yt-dlp сам выбирает экстрактор по URL, поэтому сам вызов загрузки от профиля
+// не зависит.
+type platformProfile struct {
+	name         string
+	extractID    func(rawURL string) string
+	videoMarkers []videoMarker
+	domains      []string // домены платформы для фильтрации в сабкоманде parse
+	keepParams   []string // GET-параметры, которые parse сохраняет (напр. v — ID watch-ссылок YouTube)
+}
+
+// matchesDomain сообщает, принадлежит ли URL этой платформе (по host).
+func (p *platformProfile) matchesDomain(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	// Hostname() без порта; матч точный или по границе точки — иначе
+	// evilyoutube.com / youtube.com.evil.io проходили бы фильтр.
+	host := strings.ToLower(u.Hostname())
+	for _, d := range p.domains {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupKey — ключ дедупликации ссылки: по каноническому ID, иначе по
+// нормализованному URL (без query/fragment), иначе по сырой строке.
+func (p *platformProfile) dedupKey(rawURL string) string {
+	if id := p.extractID(rawURL); id != "" {
 		return "id:" + id
 	}
 	if u, err := url.Parse(rawURL); err == nil {
@@ -549,6 +624,57 @@ func dedupKey(rawURL string) string {
 		return "url:" + u.String()
 	}
 	return "raw:" + rawURL
+}
+
+// httpURLRe грубо выхватывает http(s)-ссылки из произвольного текста (до пробела).
+var httpURLRe = regexp.MustCompile(`(?i)https?://[^\s]+`)
+
+// urlTrailingPunct — хвостовая пунктуация, прилипающая к ссылке в тексте
+// («…url).», «url,» и т.п.); срезается перед разбором.
+const urlTrailingPunct = ".,!?;:)»\"'>]"
+
+// cleanURL убирает мусорные GET-параметры и fragment, сохраняя только параметры
+// из keep (для YouTube это v — сам ID watch-ссылки). Сеть не трогается
+// (короткие ссылки не резолвятся).
+func cleanURL(rawURL string, keep []string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	if u.RawQuery != "" {
+		old := u.Query()
+		q := url.Values{}
+		for _, k := range keep {
+			if v := old.Get(k); v != "" {
+				q.Set(k, v)
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+// parseLinks выхватывает из сырого текста ссылки выбранной платформы, чистит их
+// и дедуплицирует по каноническому ID (иначе по нормализованному URL). Возвращает
+// уникальные ссылки в порядке первого появления и число найденных ссылок платформы.
+func parseLinks(text string, profile *platformProfile) (links []string, found int) {
+	seen := make(map[string]bool)
+	for _, m := range httpURLRe.FindAllString(text, -1) {
+		raw := strings.TrimRight(m, urlTrailingPunct)
+		if !profile.matchesDomain(raw) {
+			continue
+		}
+		found++
+		clean := cleanURL(raw, profile.keepParams)
+		key := profile.dedupKey(clean)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		links = append(links, clean)
+	}
+	return links, found
 }
 
 // nextProxy возвращает следующий не заблокированный прокси по кругу.
@@ -576,18 +702,54 @@ const (
 
 const failsToBan = 2 // мягкий бан: после стольких подряд-фейлов прокси банится
 
-// videoMarkers — стабильные сообщения экстрактора yt-dlp: видео недоступно
-// независимо от прокси. Стартовый набор по issue yt-dlp; вынесен отдельно,
-// чтобы легко дополнять по реальным логам TikTok-экстрактора.
-var videoMarkers = []struct{ marker, reason string }{
+// commonVideoMarkers — маркеры «видео не оживёт», общие для платформ.
+var commonVideoMarkers = []videoMarker{
 	{"video unavailable", "видео недоступно"},
 	{"this video is not available", "видео недоступно"},
-	{"this post is not available", "пост недоступен"},
 	{"private", "приватное видео"},
 	{"has been removed", "видео удалено"},
 	{"not available in your country", "geo-блокировка"},
 	{"http error 404", "404 — не найдено"},
 	{"unsupported url", "неподдерживаемый URL"},
+}
+
+// tiktokProfile / youtubeProfile — стартовые наборы маркеров дополняются по
+// реальным логам экстракторов. 403/429 сюда НЕ входят: они сетевые (retryable),
+// добиваются повтором или отдельным прогоном с --yt-bypass (только YouTube).
+var (
+	tiktokProfile = &platformProfile{
+		name:      "tiktok",
+		extractID: extractTikTokID,
+		domains:   []string{"tiktok.com"}, // покрывает www./vm./vt.tiktok.com
+		videoMarkers: append([]videoMarker{
+			{"this post is not available", "пост недоступен"},
+		}, commonVideoMarkers...),
+	}
+
+	youtubeProfile = &platformProfile{
+		name:       "youtube",
+		extractID:  extractYouTubeID,
+		domains:    []string{"youtube.com", "youtu.be"},
+		keepParams: []string{"v"}, // v у watch-ссылок — сам ID, не мусор
+		videoMarkers: append([]videoMarker{
+			{"sign in to confirm", "требуется вход / проверка бота (попробуйте --yt-bypass)"},
+			{"members-only", "только для участников канала"},
+			{"who has blocked it", "geo-блокировка"},
+			{"this live event has ended", "трансляция завершена"},
+		}, commonVideoMarkers...),
+	}
+)
+
+// profileFor возвращает профиль платформы по имени флага --platform.
+func profileFor(name string) (*platformProfile, error) {
+	switch name {
+	case "tiktok":
+		return tiktokProfile, nil
+	case "youtube":
+		return youtubeProfile, nil
+	default:
+		return nil, fmt.Errorf("неизвестная платформа %q (допустимо: tiktok, youtube)", name)
+	}
 }
 
 // proxyReasons — распознаваемые сетевые/прокси-ошибки для понятного лога.
@@ -599,13 +761,15 @@ var proxyReasons = []struct{ marker, reason string }{
 	{"connection refused", "соединение отклонено"},
 	{"timed out", "таймаут"},
 	{"max retries exceeded", "превышены ретраи соединения"},
+	{"http error 429", "429 — слишком много запросов"},
+	{"http error 403", "403 — доступ запрещён"},
 }
 
 // classifyYtdlpError — стратегия «от обратного»: сначала ищем явные video-маркеры
 // (стабильны), иначе любая ошибка трактуется как errProxy.
-func classifyYtdlpError(stderr string) (ytdlpErrKind, string) {
+func classifyYtdlpError(stderr string, profile *platformProfile) (ytdlpErrKind, string) {
 	s := strings.ToLower(stderr)
-	for _, v := range videoMarkers {
+	for _, v := range profile.videoMarkers {
 		if strings.Contains(s, v.marker) {
 			return errVideo, v.reason
 		}
@@ -615,7 +779,7 @@ func classifyYtdlpError(stderr string) (ytdlpErrKind, string) {
 			return errProxy, p.reason
 		}
 	}
-	return errProxy, "сетевая ошибка / прокси"
+	return errProxy, "сетевая ошибка"
 }
 
 // incFailAndMaybeBan увеличивает счётчик подряд-фейлов прокси и банит его при
@@ -641,28 +805,99 @@ func resetFail(proxy string) {
 	}
 }
 
-// runYtDlp запускает yt-dlp для одной ссылки через указанный прокси.
-// Возвращает stdout (для детекта «уже в архиве») и stderr (для классификации
-// ошибки) наверх.
-func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, string, error) {
-	var stdoutBuf, stderrBuf bytes.Buffer
+// runConfig — разрешённая конфигурация одного прогона загрузки. Все
+// платформо- и режимо-специфичные решения принимаются в main() ДО старта
+// воркеров, поэтому worker/runYtDlp читают уже готовые значения и не ветвятся
+// по платформе. Нулевые значения полей воспроизводят историческое поведение
+// (видео через прокси без лимита скорости), поэтому запуск без новых флагов
+// работает как раньше.
+type runConfig struct {
+	outDir    string           // папка сохранения (-o, --download-archive)
+	audio     bool             // Фаза 3 (--audio): true → аудио-режим; сейчас всегда false
+	limitRate string           // --limit-rate: passthrough в yt-dlp; "" = не добавлять
+	extraArgs []string         // Фаза 5 (--yt-bypass): доп. флаги yt-dlp, собранные в main(); nil = нет
+	noProxy   bool             // --no-proxy: прямое соединение, 1 воркер, без бан-логики прокси
+	delayMin  time.Duration    // нижняя граница паузы-джиттера между запросами воркера
+	delayMax  time.Duration    // верхняя граница паузы-джиттера
+	platform  *platformProfile // профиль платформы (--platform): извлечение ID, маркеры ошибок
+}
 
-	cmd := exec.CommandContext(ctx, "yt-dlp",
-		"-f", "bestvideo*+bestaudio/best",
-		"--merge-output-format", "mp4",
-		"-o", filepath.Join(outDir, "%(id)s.%(ext)s"),
-		"--proxy", proxy,
+// ytdlpArgs собирает аргументы вызова yt-dlp из конфига. Вынесено отдельно от
+// запуска процесса, чтобы состав флагов можно было проверять unit-тестом.
+// Порядок аргументов при дефолтном cfg совпадает с исторической реализацией.
+// ytBypassArgs возвращает bypass-бандл (--yt-bypass) для обхода 403/429. Действует
+// только на YouTube; на других платформах возвращает nil (main() предупреждает).
+// Бандл: mobile-клиент экстрактора + принудительный IPv4 (источник — рабочие
+// обходы бот-защиты YouTube).
+func ytBypassArgs(enabled bool, profile *platformProfile) []string {
+	if !enabled || profile.name != "youtube" {
+		return nil
+	}
+	return []string{
+		"--extractor-args", "youtube:player_client=android,ios",
+		"--force-ipv4",
+	}
+}
+
+func ytdlpArgs(cfg runConfig, proxy, urlLink string) []string {
+	args := make([]string, 0, 24)
+
+	// Формат и шаблон имени файла зависят от режима видео/аудио.
+	if cfg.audio {
+		// Аудио: лучший звук без перекодирования; имена по title (id для музыки бесполезен).
+		args = append(args, "-f", "bestaudio/best", "-x",
+			"-o", filepath.Join(cfg.outDir, "%(title)s.%(ext)s"),
+			"--windows-filenames")
+	} else {
+		args = append(args, "-f", "bestvideo*+bestaudio/best",
+			"--merge-output-format", "mp4",
+			"-o", filepath.Join(cfg.outDir, "%(id)s.%(ext)s"))
+	}
+
+	// Прокси опционален: в режиме --no-proxy (Фаза 1) proxy пуст — прямое соединение.
+	if proxy != "" {
+		args = append(args, "--proxy", proxy)
+	}
+
+	args = append(args,
 		"--socket-timeout", "20",
 		"--retries", "2",
 		"--concurrent-fragments", "4",
 		"--no-overwrites",
 		"--no-playlist",
 		"--newline",
-		"--no-check-certificates",
-		"--download-archive", filepath.Join(outDir, ".archive.txt"),
-		"--", // конец опций: ссылка из недоверенного links.txt не должна трактоваться как флаг yt-dlp
-		urlLink,
 	)
+
+	// TLS-проверка отключается только при работе через (потенциально MITM)
+	// прокси — задокументированный компромисс (README §Безопасность). В прямом
+	// соединении (--no-proxy) сертификаты проверяются как обычно.
+	if proxy != "" {
+		args = append(args, "--no-check-certificates")
+	}
+
+	args = append(args,
+		"--download-archive", filepath.Join(cfg.outDir, ".archive.txt"),
+	)
+
+	if cfg.limitRate != "" {
+		args = append(args, "--limit-rate", cfg.limitRate)
+	}
+
+	// Доп. флаги (напр. bypass-бандл) — перед разделителем, но после наших опций.
+	args = append(args, cfg.extraArgs...)
+
+	// «--» — конец опций: ссылка из недоверенного links.txt не станет флагом yt-dlp.
+	args = append(args, "--", urlLink)
+	return args
+}
+
+// runYtDlp запускает yt-dlp для одной ссылки через указанный прокси.
+// Возвращает stdout (для детекта «уже в архиве») и stderr (для классификации
+// ошибки) наверх.
+func runYtDlp(ctx context.Context, cfg runConfig, proxy, urlLink string) (string, string, error) {
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", ytdlpArgs(cfg, proxy, urlLink)...)
 
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
@@ -680,7 +915,79 @@ func runYtDlp(ctx context.Context, proxy, urlLink, outDir string) (string, strin
 	return stdoutBuf.String(), stderr, err
 }
 
-func worker(ctx context.Context, id int, urls <-chan string, proxies []string, idx *int32, delay time.Duration, outDir string, archive map[string]bool, wg *sync.WaitGroup) {
+// pickDelay возвращает паузу с равномерным джиттером в диапазоне [min, max].
+// При min == max (в т.ч. legacy --delay) — фиксированное значение.
+func pickDelay(min, max time.Duration) time.Duration {
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int63n(int64(max-min)))
+}
+
+// sleepJitter спит на джиттер-паузу из cfg, прерываясь по отмене контекста.
+// Возвращает false, если контекст отменён (воркеру пора выходить).
+func sleepJitter(ctx context.Context, cfg runConfig) bool {
+	d := pickDelay(cfg.delayMin, cfg.delayMax)
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// validateDelayRange проверяет инвариант 0 ≤ min ≤ max.
+func validateDelayRange(min, max time.Duration) error {
+	if min < 0 {
+		return fmt.Errorf("--delay-min не может быть отрицательным: %s", min)
+	}
+	if max < min {
+		return fmt.Errorf("--delay-min (%s) больше --delay-max (%s)", min, max)
+	}
+	return nil
+}
+
+// limitRateRe — форматы --limit-rate, которые принимает yt-dlp: число
+// (опционально дробное) с необязательным суффиксом K/M/G.
+var limitRateRe = regexp.MustCompile(`(?i)^\d+(\.\d+)?[KMG]?$`)
+
+// validateLimitRate отсекает опечатки в --limit-rate до старта: невалидное
+// значение роняло бы КАЖДЫЙ вызов yt-dlp ошибкой опций, что в прокси-режиме
+// каскадно банит весь пул (фейлы классифицируются как сетевые).
+func validateLimitRate(v string) error {
+	if v == "" || v == "0" {
+		return nil
+	}
+	if !limitRateRe.MatchString(v) {
+		return fmt.Errorf("--limit-rate: неверный формат %q (примеры: 5M, 500K, 1.5M, 1048576; 0 — снять лимит)", v)
+	}
+	return nil
+}
+
+// validateNoProxyWorkers: в режиме --no-proxy допустим только один воркер.
+// --workers 0 (авто) трактуется как «пусть решает программа» → 1, не ошибка;
+// явный --workers N>1 — конфликт (тихого clamp не делаем).
+func validateNoProxyWorkers(noProxy bool, workers int) error {
+	if noProxy && workers > 1 {
+		return fmt.Errorf("--no-proxy требует ровно 1 воркер, а задано --workers %d", workers)
+	}
+	return nil
+}
+
+// acquireProxy выбирает прокси для очередной попытки. В --no-proxy режиме прокси
+// не нужен — возвращает ("", true) (прямое соединение). В прокси-режиме делегирует
+// nextProxy; ("", false) означает, что живых прокси не осталось.
+func acquireProxy(cfg runConfig, proxies []string, idx *int32) (string, bool) {
+	if cfg.noProxy {
+		return "", true
+	}
+	return nextProxy(proxies, idx)
+}
+
+func worker(ctx context.Context, id int, urls <-chan string, proxies []string, idx *int32, cfg runConfig, archive map[string]bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for {
@@ -693,7 +1000,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 			}
 
 			// Детект уже скачанного через локальный архив
-			if videoID := extractTikTokID(urlLink); videoID != "" && archive[videoID] {
+			if videoID := cfg.platform.extractID(urlLink); videoID != "" && archive[videoID] {
 				atomic.AddInt64(&skipped, 1)
 				barAdd()
 				continue
@@ -704,7 +1011,17 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 			lastReason := "неизвестная причина"
 
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				proxy, ok := nextProxy(proxies, idx)
+				// В --no-proxy пауза-джиттер применяется также между ретраями
+				// одной ссылки (единственный IP, имитация человека).
+				if cfg.noProxy && attempt > 1 {
+					if !sleepJitter(ctx, cfg) {
+						// отмена: не теряем ссылку из учёта — фиксируем как
+						// не скачанную (как при отмене посреди скачивания),
+						// воркер выйдет по ctx.Done() ниже
+						break
+					}
+				}
+				proxy, ok := acquireProxy(cfg, proxies, idx)
 				if !ok {
 					safePrint("[%s] ⛔ W%d | свободных прокси не осталось\n",
 						time.Now().Format("15:04:05"), id)
@@ -713,7 +1030,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 					break
 				}
 
-				stdout, stderr, err := runYtDlp(ctx, proxy, urlLink, outDir)
+				stdout, stderr, err := runYtDlp(ctx, cfg, proxy, urlLink)
 				if err == nil {
 					resetFail(proxy) // прокси жив → обнуляем подряд-фейлы
 					if strings.Contains(stdout, alreadyInArchiveMarker) {
@@ -729,7 +1046,7 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 					break
 				}
 
-				kind, reason := classifyYtdlpError(stderr)
+				kind, reason := classifyYtdlpError(stderr, cfg.platform)
 				lastReason = reason
 
 				if kind == errVideo {
@@ -738,10 +1055,12 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 				}
 
 				// errProxy — +1 подряд-фейл (бан при failsToBan); причина в консоль и лог
-				incFailAndMaybeBan(proxy)
-				safePrint("[%s] ⚠ W%d | прокси-ошибка (%s), попытка %d/%d\n",
+				if !cfg.noProxy {
+					incFailAndMaybeBan(proxy)
+				}
+				safePrint("[%s] ⚠ W%d | ошибка сети (%s), попытка %d/%d\n",
 					time.Now().Format("15:04:05"), id, reason, attempt, maxAttempts)
-				logToFile("⚠ W%d | прокси-ошибка (%s), попытка %d/%d: %s",
+				logToFile("⚠ W%d | ошибка сети (%s), попытка %d/%d: %s",
 					id, reason, attempt, maxAttempts, urlLink)
 			}
 
@@ -758,11 +1077,12 @@ func worker(ctx context.Context, id int, urls <-chan string, proxies []string, i
 
 			barAdd()
 
-			if delay > 0 {
+			// Пауза-джиттер между ссылками (в обоих режимах).
+			if d := pickDelay(cfg.delayMin, cfg.delayMax); d > 0 {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(delay):
+				case <-time.After(d):
 				}
 			}
 		}
@@ -778,6 +1098,11 @@ func main() {
 				Name:  "links",
 				Value: "links.txt",
 				Usage: "Путь к файлу со ссылками",
+			},
+			&cli.StringFlag{
+				Name:  "platform",
+				Value: "tiktok",
+				Usage: "Платформа для скачивания: tiktok | youtube",
 			},
 			&cli.StringFlag{
 				Name:  "proxies",
@@ -802,7 +1127,35 @@ func main() {
 			&cli.DurationFlag{
 				Name:  "delay",
 				Value: 500 * time.Millisecond,
-				Usage: "Задержка между запросами одного воркера",
+				Usage: "[legacy] Фиксированная пауза между запросами (шорткат: delay-min = delay-max = X)",
+			},
+			&cli.DurationFlag{
+				Name:  "delay-min",
+				Usage: "Нижняя граница паузы-джиттера (default: 200ms через прокси, 2s в --no-proxy)",
+			},
+			&cli.DurationFlag{
+				Name:  "delay-max",
+				Usage: "Верхняя граница паузы-джиттера (default: 800ms через прокси, 4s в --no-proxy)",
+			},
+			&cli.BoolFlag{
+				Name:  "no-proxy",
+				Value: false,
+				Usage: "Прямое соединение без прокси: 1 воркер, паузы 2–4с, лимит скорости 5M",
+			},
+			&cli.StringFlag{
+				Name:  "limit-rate",
+				Value: "",
+				Usage: "Лимит скорости yt-dlp (напр. 5M, 500K); 0 — снять лимит. Default: 5M в --no-proxy, иначе выкл.",
+			},
+			&cli.BoolFlag{
+				Name:  "audio",
+				Value: false,
+				Usage: "Скачивать только аудио (bestaudio, без перекодирования); имена по title. Основной кейс YouTube (музыка, подкасты)",
+			},
+			&cli.BoolFlag{
+				Name:  "yt-bypass",
+				Value: false,
+				Usage: "Обход 403/429 (только YouTube): mobile-клиент + force-ipv4. Для добивания failed.txt отдельным прогоном",
 			},
 			&cli.StringFlag{
 				Name:  "log",
@@ -831,7 +1184,16 @@ func main() {
 			outDir := c.String("output")
 			numWorkers := c.Int("workers")
 			useSocks5 := c.Bool("socks5")
-			delay := c.Duration("delay")
+			noProxy := c.Bool("no-proxy")
+
+			profile, err := profileFor(c.String("platform"))
+			if err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
+			}
+			if c.Bool("yt-bypass") && profile.name != "youtube" {
+				fmt.Println("⚠️  --yt-bypass работает только с --platform youtube — флаг проигнорирован")
+			}
 			logPath := c.String("log")
 			videoSize := c.Float64("size")
 			customTestURL := c.String("test-url")
@@ -840,6 +1202,50 @@ func main() {
 
 			// Свой хост (если задан) пробуется первым, затем встроенные fallback-и.
 			testURLs := buildTestURLs(customTestURL)
+
+			// Конфликт: --no-proxy допускает только один воркер.
+			if err := validateNoProxyWorkers(noProxy, numWorkers); err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
+			}
+
+			// Диапазон паузы-джиттера: дефолт зависит от режима, затем
+			// перекрывается явными флагами (legacy --delay задаёт min = max).
+			delayMin, delayMax := 200*time.Millisecond, 800*time.Millisecond
+			if noProxy {
+				delayMin, delayMax = 2*time.Second, 4*time.Second
+			}
+			if c.IsSet("delay") {
+				d := c.Duration("delay")
+				delayMin, delayMax = d, d
+			}
+			if c.IsSet("delay-min") {
+				delayMin = c.Duration("delay-min")
+			}
+			if c.IsSet("delay-max") {
+				delayMax = c.Duration("delay-max")
+			}
+			if err := validateDelayRange(delayMin, delayMax); err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
+			}
+
+			// Лимит скорости: в --no-proxy по умолчанию 5M, иначе выкл.;
+			// явный --limit-rate перекрывает, "0" снимает лимит.
+			limitRate := ""
+			if noProxy {
+				limitRate = "5M"
+			}
+			if c.IsSet("limit-rate") {
+				limitRate = c.String("limit-rate")
+			}
+			if err := validateLimitRate(limitRate); err != nil {
+				fmt.Printf("❌ %v\n", err)
+				os.Exit(1)
+			}
+			if limitRate == "0" {
+				limitRate = ""
+			}
 
 			if numWorkers < 0 {
 				fmt.Printf("❌ --workers должно быть >= 0 (0 = автоопределение), получено %d\n", numWorkers)
@@ -890,13 +1296,9 @@ func main() {
 			}
 
 			// Читаем прокси
-			proxies, err := loadProxies(fileProxy, scheme)
+			proxies, err := loadOrSkipProxies(noProxy, c.IsSet("proxies"), fileProxy, scheme)
 			if err != nil {
 				fmt.Printf("❌ Прокси: %v\n", err)
-				os.Exit(1)
-			}
-			if len(proxies) == 0 {
-				fmt.Println("❌ Прокси пусты")
 				os.Exit(1)
 			}
 
@@ -907,7 +1309,10 @@ func main() {
 
 			// Тест прокси / авто-расчёт воркеров
 			recommendedWorkers := numWorkers
-			if numWorkers == 0 {
+			if noProxy {
+				recommendedWorkers = 1
+				fmt.Println("🔒 Режим --no-proxy: прямое соединение, 1 воркер (тест скорости пропущен)")
+			} else if numWorkers == 0 {
 				fmt.Println("🧪 Тестирую прокси и замеряю скорость...")
 				avgSpeed, err := runProxyTest(ctx, proxies, scheme, testURLs)
 				if err != nil {
@@ -938,7 +1343,7 @@ func main() {
 				if line == "" {
 					continue
 				}
-				key := dedupKey(line)
+				key := profile.dedupKey(line)
 				if !seen[key] {
 					seen[key] = true
 					urlList = append(urlList, line)
@@ -951,8 +1356,16 @@ func main() {
 				fmt.Println("❌ Файл ссылок пуст")
 				os.Exit(1)
 			}
-			fmt.Printf("🚀 СТАРТ: %d ссылок | %d воркеров | Прокси: %d\n",
-				totalVideos, recommendedWorkers, len(proxies))
+			netInfo := fmt.Sprintf("Прокси: %d", len(proxies))
+			if noProxy {
+				rate := limitRate
+				if rate == "" {
+					rate = "выкл"
+				}
+				netInfo = fmt.Sprintf("без прокси | limit-rate %s", rate)
+			}
+			fmt.Printf("🚀 СТАРТ: %d ссылок | %d воркеров | %s\n",
+				totalVideos, recommendedWorkers, netInfo)
 			logToFile("Старт: %d ссылок, %d воркеров, %d прокси", totalVideos, recommendedWorkers, len(proxies))
 
 			// Инициализация progressbar под printMu: sig-handler читает bar
@@ -987,9 +1400,22 @@ func main() {
 			var wg sync.WaitGroup
 			var proxyIdx int32 = -1
 
+			// Конфиг прогона: платформо-/режимо-специфика резолвится здесь один раз
+			// и дальше только читается воркерами. Нулевые поля = историческое поведение.
+			cfg := runConfig{
+				outDir:    outDir,
+				limitRate: limitRate,
+				noProxy:   noProxy,
+				delayMin:  delayMin,
+				delayMax:  delayMax,
+				platform:  profile,
+				audio:     c.Bool("audio"),
+				extraArgs: ytBypassArgs(c.Bool("yt-bypass"), profile),
+			}
+
 			for i := 0; i < recommendedWorkers; i++ {
 				wg.Add(1)
-				go worker(ctx, i, urlCh, proxies, &proxyIdx, delay, outDir, archive, &wg)
+				go worker(ctx, i, urlCh, proxies, &proxyIdx, cfg, archive, &wg)
 			}
 
 			wg.Wait()
@@ -1036,6 +1462,41 @@ func main() {
 			return nil
 		},
 		Commands: []*cli.Command{
+			{
+				Name:  "parse",
+				Usage: "Извлечь и очистить ссылки платформы из произвольного текста (без сети)",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "input", Required: true, Usage: "Файл с сырым текстом (история, скопированная страница)"},
+					&cli.StringFlag{Name: "output", Value: "links.txt", Usage: "Куда записать очищенные ссылки"},
+					&cli.StringFlag{Name: "platform", Value: "tiktok", Usage: "Платформа: tiktok | youtube"},
+				},
+				Action: func(c *cli.Context) error {
+					profile, err := profileFor(c.String("platform"))
+					if err != nil {
+						return err
+					}
+					inPath := c.String("input")
+					data, err := os.ReadFile(inPath)
+					if err != nil {
+						return fmt.Errorf("не удалось прочитать %s: %w", inPath, err)
+					}
+					text := string(data)
+					lines := strings.Count(text, "\n") + 1
+					links, found := parseLinks(text, profile)
+
+					out := ""
+					if len(links) > 0 {
+						out = strings.Join(links, "\n") + "\n"
+					}
+					outPath := c.String("output")
+					if err := os.WriteFile(outPath, []byte(out), 0644); err != nil {
+						return fmt.Errorf("не удалось записать %s: %w", outPath, err)
+					}
+					fmt.Printf("📄 parse [%s]: строк обработано %d | URL найдено %d | уникальных записано %d → %s\n",
+						profile.name, lines, found, len(links), outPath)
+					return nil
+				},
+			},
 			{
 				Name:  "update",
 				Usage: "Обновить yt-dlp до последней версии",
