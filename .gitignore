@@ -4,7 +4,16 @@
 # Скачанные видео и логи
 downloads/
 failed.txt
+failed_reasons.txt
+.archive.txt
 *.log
+
+# Пользовательские данные на вход (прокси и ссылки) — не хранятся в репозитории
+proxies.txt
+proxy.txt
+links.txt
+links_*.txt
+raw.txt
 
 # Бинарник
 *.exe
